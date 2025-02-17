@@ -50,14 +50,16 @@ job_queue = Queue()
 processing_lock = threading.Lock()
 
 # ------------------------------------------------------
-# Helper: Save job metadata to file
+# Helper: Save job metadata to file (filtering out ephemeral keys)
 # ------------------------------------------------------
 def save_job_metadata(job_id, job_info):
     job_dir = os.path.join(JOB_BASE, job_id)
     metadata_file = os.path.join(job_dir, "job_metadata.json")
+    # Do not persist ephemeral fields such as progress and eta
+    filtered_info = {k: v for k, v in job_info.items() if k not in ("progress", "eta")}
     try:
         with open(metadata_file, "w", encoding="utf-8") as f:
-            json.dump(job_info, f)
+            json.dump(filtered_info, f)
     except Exception as e:
         logger.error(f"Failed to save metadata for job {job_id}: {e}")
 
@@ -80,7 +82,6 @@ def load_jobs_from_disk():
                 except Exception as e:
                     logger.error(f"Failed to load metadata for job {job_id}: {e}")
             if job_info is None:
-                # Try to reconstruct minimal info if metadata is missing.
                 job_info = {}
                 files = os.listdir(job_dir)
                 input_file = None
@@ -93,15 +94,14 @@ def load_jobs_from_disk():
                 job_info["audio_duration"] = 0.0
                 job_info["estimated_time"] = 0.0
                 job_info["created_at"] = os.path.getctime(job_dir)
-                job_info["progress"] = 0
             without_path = os.path.join(job_dir, "output_without_timestamps.txt")
             with_path = os.path.join(job_dir, "output_with_timestamps.txt")
             if os.path.exists(without_path) and os.path.exists(with_path):
                 job_info["status"] = "done"
-                job_info["progress"] = 100
-                job_info["eta"] = 0
                 job_info["result_files"] = {"without": without_path, "with": with_path}
             else:
+                # Jobs not complete before shutdown are marked as failed,
+                # but they can be restarted via the new restart endpoint.
                 job_info["status"] = "failed"
                 job_info["error"] = "Job did not complete before server restart."
             jobs_dict[job_id] = job_info
@@ -143,7 +143,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
             current_info["progress"] = int(fraction * 100)
             current_info["eta"] = max(int(estimated_transcription_time - elapsed), 0)
             shared_jobs[job_id] = current_info
-            save_job_metadata(job_id, current_info)
+            # Note: progress and eta are not saved to disk.
             if current_info["progress"] >= 100:
                 return
             time.sleep(1)
@@ -348,9 +348,7 @@ def index():
   <script src="https://cdn.tailwindcss.com"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <script>
-    function toggleDarkMode() {
-      document.documentElement.classList.toggle("dark");
-    }
+    function toggleDarkMode() { document.documentElement.classList.toggle("dark"); }
   </script>
 </head>
 <body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100 min-h-screen">
@@ -461,6 +459,7 @@ def index():
           if (job.error) html += `<div class="mt-2 text-red-400"><strong>Error:</strong> ${job.error}</div>`;
           html += `<div>
                      <button onclick="removeJob('${job.id}')" class="mt-2 px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700">Remove Job</button>
+                     <button onclick="restartJob('${job.id}')" class="mt-2 ml-2 px-3 py-1 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">Restart Job</button>
                    </div>`;
         }
         if (job.status === "deleting") {
@@ -482,6 +481,20 @@ def index():
       } catch (error) {
         console.error('Error removing job:', error);
         alert('Error removing job: ' + error.message);
+      }
+    }
+    async function restartJob(jobId) {
+      if (!confirm('Are you sure you want to restart this failed job?')) return;
+      try {
+        const response = await fetch('/restart/' + jobId);
+        if (!response.ok) {
+          const error = await response.text();
+          console.error('Failed to restart job:', error);
+          alert('Failed to restart job: ' + error);
+        }
+      } catch (error) {
+        console.error('Error restarting job:', error);
+        alert('Error restarting job: ' + error.message);
       }
     }
     function submitForm() {
@@ -588,24 +601,48 @@ async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
     })
     return {"job_id": job_id, "message": "File uploaded and job queued."}
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    try:
-        await websocket.accept()
-        client = f"{websocket.client.host}:{websocket.client.port}"
-        logger.info(f"New WebSocket connection from {client}")
-        while True:
-            try:
-                await websocket.send_json(dict(jobs))
-                await asyncio.sleep(1)
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected: {client}")
-                break
-            except Exception as e:
-                logger.error(f"WebSocket error: {str(e)}", exc_info=True)
-                break
-    except Exception as e:
-        logger.error(f"WebSocket connection error: {str(e)}", exc_info=True)
+@app.get("/restart/{job_id}")
+def restart_job(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    if job["status"] not in ("failed", "cancelled"):
+        raise HTTPException(status_code=400, detail="Only failed or cancelled jobs can be restarted.")
+    # Reset job state
+    job["status"] = "pending"
+    job["error"] = None
+    job["progress"] = 0
+    job["eta"] = None
+    save_job_metadata(job_id, job)
+    # Requeue the job for processing
+    job_queue.put({
+        "job_id": job_id,
+        "file_location": job["input_file"],
+        "mode": job["mode"]
+    })
+    return {"message": f"Job {job_id} restarted."}
+
+@app.get("/remove/{job_id}")
+def remove_job(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    job["status"] = "deleting"
+    save_job_metadata(job_id, job)
+    def delete_job():
+        job_dir = os.path.join(JOB_BASE, job_id)
+        try:
+            shutil.rmtree(job_dir)
+        except Exception as e:
+            logger.error(f"Error deleting job folder {job_id}: {e}")
+        if job_id in job_processes:
+            proc = job_processes[job_id]
+            if proc.is_alive():
+                proc.terminate()
+            del job_processes[job_id]
+        del jobs[job_id]
+    threading.Thread(target=delete_job, daemon=True).start()
+    return {"message": f"Job {job_id} is being deleted."}
 
 @app.get("/download/{job_id}/{file_type}")
 def download_file(job_id: str, file_type: str):
@@ -622,31 +659,6 @@ def download_file(job_id: str, file_type: str):
     base_name = os.path.splitext(os.path.basename(job["input_file"]))[0]
     dl_name = f"{base_name}_transcription.txt" if file_type == "without" else f"{base_name}_transcription_timestamps.txt"
     return FileResponse(file_path, media_type="text/plain", filename=dl_name)
-
-@app.get("/remove/{job_id}")
-def remove_job(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    # First update the job status to "deleting"
-    job = jobs[job_id]
-    job["status"] = "deleting"
-    save_job_metadata(job_id, job)
-    # Spawn a thread to do the actual deletion
-    def delete_job():
-        job_dir = os.path.join(JOB_BASE, job_id)
-        try:
-            shutil.rmtree(job_dir)
-        except Exception as e:
-            logger.error(f"Error deleting job folder {job_id}: {e}")
-        if job_id in job_processes:
-            proc = job_processes[job_id]
-            if proc.is_alive():
-                proc.terminate()
-            del job_processes[job_id]
-        # Finally remove the job from the shared dict
-        del jobs[job_id]
-    threading.Thread(target=delete_job, daemon=True).start()
-    return {"message": f"Job {job_id} is being deleted."}
 
 @app.get("/jobs", response_class=JSONResponse)
 def get_jobs():
