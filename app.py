@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from contextlib import asynccontextmanager
 from queue import Queue
+import json
 
 # ------------------------------------------------------
 # Logging Setup
@@ -49,6 +50,68 @@ job_queue = Queue()
 processing_lock = threading.Lock()
 
 # ------------------------------------------------------
+# Helper: Save job metadata to file
+# ------------------------------------------------------
+def save_job_metadata(job_id, job_info):
+    job_dir = os.path.join(JOB_BASE, job_id)
+    metadata_file = os.path.join(job_dir, "job_metadata.json")
+    try:
+        with open(metadata_file, "w", encoding="utf-8") as f:
+            json.dump(job_info, f)
+    except Exception as e:
+        logger.error(f"Failed to save metadata for job {job_id}: {e}")
+
+# ------------------------------------------------------
+# Helper: Load jobs from disk at startup
+# ------------------------------------------------------
+def load_jobs_from_disk():
+    jobs_dict = {}
+    if not os.path.exists(JOB_BASE):
+        return jobs_dict
+    for job_id in os.listdir(JOB_BASE):
+        job_dir = os.path.join(JOB_BASE, job_id)
+        if os.path.isdir(job_dir):
+            metadata_file = os.path.join(job_dir, "job_metadata.json")
+            job_info = None
+            if os.path.exists(metadata_file):
+                try:
+                    with open(metadata_file, "r", encoding="utf-8") as f:
+                        job_info = json.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to load metadata for job {job_id}: {e}")
+            if job_info is None:
+                # Try to reconstruct minimal info if metadata is missing.
+                job_info = {}
+                files = os.listdir(job_dir)
+                # Pick an input file (ignoring known output/metadata files)
+                input_file = None
+                for f in files:
+                    if f not in ("input.wav", "output_without_timestamps.txt", "output_with_timestamps.txt", "job_metadata.json"):
+                        input_file = os.path.join(job_dir, f)
+                        break
+                job_info["input_file"] = input_file if input_file else ""
+                job_info["mode"] = "unknown"
+                job_info["audio_duration"] = 0.0
+                job_info["estimated_time"] = 0.0
+                job_info["created_at"] = os.path.getctime(job_dir)
+                job_info["progress"] = 0
+            # If result files exist, mark as done; otherwise, mark as failed
+            without_path = os.path.join(job_dir, "output_without_timestamps.txt")
+            with_path = os.path.join(job_dir, "output_with_timestamps.txt")
+            if os.path.exists(without_path) and os.path.exists(with_path):
+                job_info["status"] = "done"
+                job_info["progress"] = 100
+                job_info["eta"] = 0
+                job_info["result_files"] = {"without": without_path, "with": with_path}
+            else:
+                # Any job not complete is considered failed after restart.
+                # (They will still be removable via the UI.)
+                job_info["status"] = "failed"
+                job_info["error"] = "Job did not complete before server restart."
+            jobs_dict[job_id] = job_info
+    return jobs_dict
+
+# ------------------------------------------------------
 # Utility: Get audio duration via ffmpeg
 # ------------------------------------------------------
 def get_audio_duration(file_path: str) -> float:
@@ -66,7 +129,7 @@ def get_audio_duration(file_path: str) -> float:
 def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutdown_event: Event):
     """
     Pulls job from the shared dict, loads Whisper, processes either 'one', 'stereo', or 'diarization',
-    updates progress, writes output files, sets status=done at the end.
+    updates progress, writes output files, and sets status=done at the end.
     """
     logger.info(f"Starting job {job_id} in {mode} mode with file {input_file_path}")
 
@@ -75,6 +138,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
     estimated_transcription_time = job_info.get("estimated_time", 0.0)
     job_info["status"] = "processing"
     shared_jobs[job_id] = job_info
+    save_job_metadata(job_id, job_info)
 
     start_time = time.time()
 
@@ -101,6 +165,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
             current_info["progress"] = progress_pct
             current_info["eta"] = eta_seconds
             shared_jobs[job_id] = current_info
+            save_job_metadata(job_id, current_info)
 
             if progress_pct >= 100:
                 return
@@ -120,7 +185,6 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
 
         # 4) Process according to mode
         if mode == "one":
-            # single speaker
             result = model.transcribe(job_input_file, language="en")
             segments = result.get("segments", [])
             merged_plain, merged_ts = [], []
@@ -204,6 +268,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
             "result_files": {"without": out_plain, "with": out_ts}
         })
         shared_jobs[job_id] = final_info
+        save_job_metadata(job_id, final_info)
         logger.info(f"Job {job_id} completed successfully.")
 
     except Exception as e:
@@ -220,6 +285,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
                 "error": str(e)
             })
         shared_jobs[job_id] = error_info
+        save_job_metadata(job_id, error_info)
 
     finally:
         updater_thread.join(timeout=2.0)
@@ -328,8 +394,7 @@ def process_queue():
             logger.error(f"Error in queue processing: {str(e)}", exc_info=True)
 
 # ------------------------------------------------------
-# The HTML with minimal references to ID, plus "finishing up..." text
-# Also with a mode -> friendly text mapping
+# The HTML with inline JavaScript
 # ------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -339,7 +404,6 @@ def index():
 <head>
   <meta charset="UTF-8">
   <title>Audio/Video Transcription</title>
-  <!-- Set darkMode:'class' before Tailwind -->
   <script>
     tailwind = {
       config: {
@@ -410,14 +474,12 @@ def index():
   </div>
 
   <script>
-    // We'll map the internal 'mode' strings to user-friendly text:
     const modeMapping = {
       "one": "One Speaker Mode",
       "stereo": "Stereo Mode",
       "diarization": "Speaker Detection Mode"
     };
 
-    // Format seconds => "Xh Ym Zs"
     function formatHMS(sec) {
       if (!sec || sec < 0) sec = 0;
       let h = Math.floor(sec / 3600);
@@ -430,7 +492,6 @@ def index():
       return parts.length > 0 ? parts.join(" ") : "0s";
     }
 
-    // Convert jobs object => sorted array
     function parseJobs(jobs) {
       let arr = [];
       for (let jobId in jobs) {
@@ -446,9 +507,6 @@ def index():
       return arr;
     }
 
-    // For each job in sorted order:
-    // If job is processing => leftover=job.eta
-    // Else if queued => leftover += estimated_time
     function computeQueueEtas(jobsArr) {
       let cumulative = 0;
       let totalQueueTime = 0;
@@ -475,34 +533,24 @@ def index():
     function renderJobs(jobsDict) {
       const jobListDiv = document.getElementById("job-list");
       jobListDiv.innerHTML = "";
-
       const jobsArr = parseJobs(jobsDict);
       const totalTime = computeQueueEtas(jobsArr);
-
-      // Show total queue time
       const totalDiv = document.getElementById("totalTime");
       totalDiv.textContent = "Estimated time for entire queue: " + formatHMS(totalTime);
 
       for (let i = 0; i < jobsArr.length; i++) {
         let job = jobsArr[i];
-        // Create a card
         let card = document.createElement("div");
         card.className = "p-4 border border-gray-300 dark:border-gray-700 rounded shadow-sm";
+        card.id = "job-" + job.id;  // Assign unique ID for direct removal
 
-        // We only show the file name, not the job ID or path
-        // Extract just the original filename without the job path
         let filename = job.input_file.split(/(\\|\/)/g).pop();
         if (filename.startsWith('jobs/')) {
             filename = filename.split('/').pop();
         }
-
-        // Overwrite statusText if "pending" => "Queued"
         let statusText = job.status;
         if (job.status === "pending") statusText = "Queued";
-
-        // Build up HTML
         let html = `<div class="font-semibold text-lg">${filename}</div>`;
-        // Show the friendlier text for the mode:
         let displayMode = modeMapping[job.mode] || job.mode;
         html += `<div class="text-sm text-gray-600 dark:text-gray-400">Mode: ${displayMode}</div>`;
         html += `<div class="mt-2"><strong>Status:</strong> ${statusText}</div>`;
@@ -516,7 +564,6 @@ def index():
               </div>
               <span class="text-sm">${pct}%</span>
           `;
-          // Instead of showing 0s, show "finishing up..."
           if (job.eta !== null && job.eta !== undefined) {
             if (job.eta <= 1 && pct < 100) {
               html += ` <span class="text-sm">(ETA: finishing up...)</span>`;
@@ -524,21 +571,19 @@ def index():
               html += ` <span class="text-sm">(ETA: ${formatHMS(job.eta)})</span>`;
             }
           }
-          // Spinner
           html += `
               <div class="w-4 h-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin"></div>
             </div>
           `;
         }
-        if (statusText === "Queued") {
+        if (job.status === "pending") {
           let est = job.estimated_time ? formatHMS(job.estimated_time) : "unknown";
           html += `<div class="mt-2 text-sm">Estimated job time: ${est}</div>`;
-
           if (job.etaFromNow) {
             html += `<div class="mt-1 text-sm">Estimated finish in: ${formatHMS(job.etaFromNow)}</div>`;
           }
         }
-        if (statusText === "done") {
+        if (job.status === "done") {
           html += `
             <div class="mt-2"><strong>Progress:</strong> 100%</div>
             <div class="mt-1">
@@ -547,6 +592,8 @@ def index():
             <div>
               <a href="/download/${job.id}/with" class="text-blue-600 dark:text-blue-400 hover:underline">Download with timestamps</a>
             </div>
+          `;
+          html += `
             <div>
               <button onclick="removeJob('${job.id}')"
                 class="mt-2 px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700"
@@ -556,12 +603,20 @@ def index():
             </div>
           `;
         }
-        if (statusText === "failed" || statusText === "cancelled") {
+        if (job.status === "failed" || job.status === "cancelled") {
           if (job.error) {
             html += `<div class="mt-2 text-red-400"><strong>Error:</strong> ${job.error}</div>`;
           }
+          html += `
+            <div>
+              <button onclick="removeJob('${job.id}')"
+                class="mt-2 px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700"
+              >
+                Remove Job
+              </button>
+            </div>
+          `;
         }
-
         card.innerHTML = html;
         jobListDiv.appendChild(card);
       }
@@ -574,6 +629,11 @@ def index():
         if (response.ok) {
           const result = await response.json();
           console.log(result.message);
+          // Immediately remove the job card from the DOM.
+          const card = document.getElementById("job-" + jobId);
+          if (card) {
+             card.remove();
+          }
         } else {
           const error = await response.text();
           console.error('Failed to remove job:', error);
@@ -585,7 +645,7 @@ def index():
       }
     }
 
-    async function submitForm() {
+    function submitForm() {
       const form = document.getElementById("uploadForm");
       const formData = new FormData(form);
       const progressDiv = document.getElementById("uploadProgress");
@@ -593,51 +653,44 @@ def index():
       const progressText = document.getElementById("progressText");
       const uploadButton = document.getElementById("uploadButton");
 
-      try {
-        uploadButton.disabled = true;
-        progressDiv.classList.remove("hidden");
+      uploadButton.disabled = true;
+      progressDiv.classList.remove("hidden");
 
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", "/upload", true);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/upload", true);
 
-        xhr.upload.onprogress = function(e) {
-          if (e.lengthComputable) {
-            const pct = (e.loaded / e.total) * 100;
-            progressBar.style.width = pct + "%";
-            progressText.textContent = Math.round(pct) + "%";
-          }
-        };
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+          const pct = (e.loaded / e.total) * 100;
+          progressBar.style.width = pct + "%";
+          progressText.textContent = Math.round(pct) + "%";
+        }
+      };
 
-        xhr.onload = function() {
-          if (xhr.status === 200) {
-            form.reset();
-            console.log("Upload successful:", xhr.response);
-          } else {
-            console.error("Upload failed:", xhr.responseText);
-            alert("Upload failed: " + xhr.responseText);
-          }
-          progressDiv.classList.add("hidden");
-          uploadButton.disabled = false;
-          progressBar.style.width = "0%";
-          progressText.textContent = "0%";
-        };
-
-        xhr.onerror = function() {
-          console.error("Upload error");
-          alert("Upload error");
-          progressDiv.classList.add("hidden");
-          uploadButton.disabled = false;
-          progressBar.style.width = "0%";
-          progressText.textContent = "0%";
-        };
-
-        xhr.send(formData);
-      } catch (error) {
-        console.error("Upload error:", error);
-        alert("Upload error: " + error.message);
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          form.reset();
+          console.log("Upload successful:", xhr.response);
+        } else {
+          console.error("Upload failed:", xhr.responseText);
+          alert("Upload failed: " + xhr.responseText);
+        }
         progressDiv.classList.add("hidden");
         uploadButton.disabled = false;
-      }
+        progressBar.style.width = "0%";
+        progressText.textContent = "0%";
+      };
+
+      xhr.onerror = function() {
+        console.error("Upload error");
+        alert("Upload error");
+        progressDiv.classList.add("hidden");
+        uploadButton.disabled = false;
+        progressBar.style.width = "0%";
+        progressText.textContent = "0%";
+      };
+
+      xhr.send(formData);
     }
 
     function connectWebSocket() {
@@ -656,7 +709,6 @@ def index():
     }
 
     document.addEventListener("DOMContentLoaded", function() {
-      // load jobs
       fetch("/jobs")
         .then(resp => {
           if (!resp.ok) throw new Error("Failed to load jobs: " + resp.status);
@@ -664,8 +716,6 @@ def index():
         })
         .then(data => renderJobs(data))
         .catch(err => console.error("Failed to load jobs:", err));
-
-      // start the WS
       connectWebSocket();
     });
   </script>
@@ -691,13 +741,13 @@ async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
         f.write(content)
 
     duration_sec = get_audio_duration(file_location)
-    speed_ratio = 1.0  # or adjust if your system is faster/slower than real-time
+    speed_ratio = 1.0  # Adjust if needed.
     estimated_time = duration_sec * speed_ratio
 
-    jobs[job_id] = {
+    job_info = {
         "status": "pending",
         "input_file": file_location,
-        "mode": mode,  # We'll map to user-friendly text in the UI
+        "mode": mode,
         "progress": 0,
         "eta": None,
         "error": None,
@@ -705,6 +755,8 @@ async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
         "estimated_time": estimated_time,
         "created_at": time.time()
     }
+    jobs[job_id] = job_info
+    save_job_metadata(job_id, job_info)
 
     job_queue.put({
         "job_id": job_id,
@@ -748,18 +800,13 @@ def download_file(job_id: str, file_type: str):
         raise HTTPException(status_code=404, detail="File not found")
 
     base_name = os.path.splitext(os.path.basename(job["input_file"]))[0]
-    if file_type == "without":
-        dl_name = f"{base_name}_transcription.txt"
-    else:
-        dl_name = f"{base_name}_transcription_timestamps.txt"
-
+    dl_name = f"{base_name}_transcription.txt" if file_type == "without" else f"{base_name}_transcription_timestamps.txt"
     return FileResponse(file_path, media_type="text/plain", filename=dl_name)
 
 @app.get("/remove/{job_id}")
 def remove_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-
     job_dir = os.path.join(JOB_BASE, job_id)
     try:
         shutil.rmtree(job_dir)
@@ -777,11 +824,17 @@ def remove_job(job_id: str):
 def get_jobs():
     return dict(jobs)
 
+# ------------------------------------------------------
+# Startup: Initialize manager, load jobs from disk, and start the queue processor
+# ------------------------------------------------------
 def process_startup():
     global manager, jobs, shutdown_event
     multiprocessing.freeze_support()
     manager = multiprocessing.Manager()
     jobs = manager.dict()
+    loaded_jobs = load_jobs_from_disk()
+    for job_id, job_info in loaded_jobs.items():
+        jobs[job_id] = job_info
     shutdown_event = multiprocessing.Event()
     queue_thread = threading.Thread(target=process_queue, daemon=True)
     queue_thread.start()
