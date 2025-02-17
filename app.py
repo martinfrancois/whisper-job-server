@@ -118,6 +118,53 @@ def get_audio_duration(file_path: str) -> float:
         return 0.0
 
 # ------------------------------------------------------
+# Lifespan Context Manager
+# ------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    shutdown_event.set()
+    logger.info("Shutdown event set; terminating running jobs if any.")
+    for j_id, proc in job_processes.items():
+        if proc.is_alive():
+            proc.terminate()
+            logger.info(f"Terminated process for job_id={j_id}")
+
+# ------------------------------------------------------
+# Create FastAPI App and Add Middleware
+# ------------------------------------------------------
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------------------------------
+# WebSocket Endpoint
+# ------------------------------------------------------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    try:
+        await websocket.accept()
+        client = f"{websocket.client.host}:{websocket.client.port}"
+        logger.info(f"New WebSocket connection from {client}")
+        while True:
+            try:
+                await websocket.send_json(dict(jobs))
+                await asyncio.sleep(1)
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected: {client}")
+                break
+            except Exception as e:
+                logger.error(f"WebSocket error: {str(e)}", exc_info=True)
+                break
+    except Exception as e:
+        logger.error(f"WebSocket connection error: {str(e)}", exc_info=True)
+
+# ------------------------------------------------------
 # Main Job Processing Function
 # ------------------------------------------------------
 def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutdown_event: Event):
@@ -292,67 +339,7 @@ def merge_transcripts(left_data, right_data):
     return merged_plain, merged_ts
 
 # ------------------------------------------------------
-# WebSocket Endpoint
-# ------------------------------------------------------
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    try:
-        await websocket.accept()
-        client = f"{websocket.client.host}:{websocket.client.port}"
-        logger.info(f"New WebSocket connection from {client}")
-        while True:
-            try:
-                await websocket.send_json(dict(jobs))
-                await asyncio.sleep(1)
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected: {client}")
-                break
-            except Exception as e:
-                logger.error(f"WebSocket error: {str(e)}", exc_info=True)
-                break
-    except Exception as e:
-        logger.error(f"WebSocket connection error: {str(e)}", exc_info=True)
-
-# ------------------------------------------------------
-# FastAPI lifespan, queue processing
-# ------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    shutdown_event.set()
-    logger.info("Shutdown event set; terminating running jobs if any.")
-    for j_id, proc in job_processes.items():
-        if proc.is_alive():
-            proc.terminate()
-            logger.info(f"Terminated process for job_id={j_id}")
-
-app = FastAPI(lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def process_queue():
-    while True:
-        if shutdown_event.is_set():
-            break
-        try:
-            if not job_queue.empty():
-                with processing_lock:
-                    job_data = job_queue.get()
-                    if job_data:
-                        process_job(jobs, job_data['job_id'], job_data['file_location'], job_data['mode'], shutdown_event)
-            else:
-                time.sleep(1)
-        except Exception as e:
-            logger.error(f"Error in queue processing: {str(e)}", exc_info=True)
-
-# ------------------------------------------------------
-# HTML with Inline JavaScript
+# Index HTML Endpoint (with inline JS)
 # ------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -386,7 +373,9 @@ def index():
         </select>
       </div>
       <div class="flex items-center space-x-4">
-        <button type="button" id="uploadButton" onclick="submitForm()" class="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition disabled:opacity-50">Upload</button>
+        <button type="button" id="uploadButton" onclick="submitForm()" class="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition disabled:opacity-50">
+          Upload
+        </button>
         <div id="uploadProgress" class="hidden">
           <div class="w-64 bg-gray-200 dark:bg-gray-700 rounded">
             <div id="progressBar" class="h-2 bg-green-500 rounded" style="width: 0%"></div>
@@ -580,7 +569,7 @@ def index():
     return html_content
 
 # ------------------------------------------------------
-# Endpoints
+# Upload Endpoint
 # ------------------------------------------------------
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
@@ -615,6 +604,9 @@ async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
     })
     return {"job_id": job_id, "message": "File uploaded and job queued."}
 
+# ------------------------------------------------------
+# Restart Endpoint
+# ------------------------------------------------------
 @app.get("/restart/{job_id}")
 def restart_job(job_id: str):
     if job_id not in jobs:
@@ -634,6 +626,9 @@ def restart_job(job_id: str):
     })
     return {"message": f"Job {job_id} restarted."}
 
+# ------------------------------------------------------
+# Remove Endpoint
+# ------------------------------------------------------
 @app.get("/remove/{job_id}")
 def remove_job(job_id: str):
     if job_id not in jobs:
@@ -656,6 +651,9 @@ def remove_job(job_id: str):
     threading.Thread(target=delete_job, daemon=True).start()
     return {"message": f"Job {job_id} is being deleted."}
 
+# ------------------------------------------------------
+# Download Endpoint
+# ------------------------------------------------------
 @app.get("/download/{job_id}/{file_type}")
 def download_file(job_id: str, file_type: str):
     if job_id not in jobs:
@@ -672,12 +670,33 @@ def download_file(job_id: str, file_type: str):
     dl_name = f"{base_name}_transcription.txt" if file_type == "without" else f"{base_name}_transcription_timestamps.txt"
     return FileResponse(file_path, media_type="text/plain", filename=dl_name)
 
+# ------------------------------------------------------
+# Get Jobs Endpoint
+# ------------------------------------------------------
 @app.get("/jobs", response_class=JSONResponse)
 def get_jobs():
     return dict(jobs)
 
 # ------------------------------------------------------
-# Startup: Initialize manager, load jobs from disk, and start the queue processor
+# Queue Processing Function
+# ------------------------------------------------------
+def process_queue():
+    while True:
+        if shutdown_event.is_set():
+            break
+        try:
+            if not job_queue.empty():
+                with processing_lock:
+                    job_data = job_queue.get()
+                    if job_data:
+                        process_job(jobs, job_data['job_id'], job_data['file_location'], job_data['mode'], shutdown_event)
+            else:
+                time.sleep(1)
+        except Exception as e:
+            logger.error(f"Error in queue processing: {str(e)}", exc_info=True)
+
+# ------------------------------------------------------
+# Startup: Initialize manager, load jobs, and start queue processing
 # ------------------------------------------------------
 def process_startup():
     global manager, jobs, shutdown_event
