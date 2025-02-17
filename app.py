@@ -28,9 +28,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(
-            os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-        ),
+        logging.FileHandler(os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')),
         logging.StreamHandler()
     ]
 )
@@ -55,7 +53,7 @@ processing_lock = threading.Lock()
 def save_job_metadata(job_id, job_info):
     job_dir = os.path.join(JOB_BASE, job_id)
     metadata_file = os.path.join(job_dir, "job_metadata.json")
-    # Do not persist ephemeral fields such as progress and eta
+    # Do not persist ephemeral fields such as "progress" and "eta"
     filtered_info = {k: v for k, v in job_info.items() if k not in ("progress", "eta")}
     try:
         with open(metadata_file, "w", encoding="utf-8") as f:
@@ -82,6 +80,7 @@ def load_jobs_from_disk():
                 except Exception as e:
                     logger.error(f"Failed to load metadata for job {job_id}: {e}")
             if job_info is None:
+                # Reconstruct minimal info if missing
                 job_info = {}
                 files = os.listdir(job_dir)
                 input_file = None
@@ -100,8 +99,7 @@ def load_jobs_from_disk():
                 job_info["status"] = "done"
                 job_info["result_files"] = {"without": without_path, "with": with_path}
             else:
-                # Jobs not complete before shutdown are marked as failed,
-                # but they can be restarted via the new restart endpoint.
+                # Mark incomplete jobs as failed (they can be restarted)
                 job_info["status"] = "failed"
                 job_info["error"] = "Job did not complete before server restart."
             jobs_dict[job_id] = job_info
@@ -143,7 +141,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
             current_info["progress"] = int(fraction * 100)
             current_info["eta"] = max(int(estimated_transcription_time - elapsed), 0)
             shared_jobs[job_id] = current_info
-            # Note: progress and eta are not saved to disk.
+            # Ephemeral fields are not saved to disk.
             if current_info["progress"] >= 100:
                 return
             time.sleep(1)
@@ -294,6 +292,28 @@ def merge_transcripts(left_data, right_data):
     return merged_plain, merged_ts
 
 # ------------------------------------------------------
+# WebSocket Endpoint
+# ------------------------------------------------------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    try:
+        await websocket.accept()
+        client = f"{websocket.client.host}:{websocket.client.port}"
+        logger.info(f"New WebSocket connection from {client}")
+        while True:
+            try:
+                await websocket.send_json(dict(jobs))
+                await asyncio.sleep(1)
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected: {client}")
+                break
+            except Exception as e:
+                logger.error(f"WebSocket error: {str(e)}", exc_info=True)
+                break
+    except Exception as e:
+        logger.error(f"WebSocket connection error: {str(e)}", exc_info=True)
+
+# ------------------------------------------------------
 # FastAPI lifespan, queue processing
 # ------------------------------------------------------
 @asynccontextmanager
@@ -332,7 +352,7 @@ def process_queue():
             logger.error(f"Error in queue processing: {str(e)}", exc_info=True)
 
 # ------------------------------------------------------
-# The HTML with inline JavaScript
+# HTML with Inline JavaScript
 # ------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -342,14 +362,10 @@ def index():
 <head>
   <meta charset="UTF-8">
   <title>Audio/Video Transcription</title>
-  <script>
-    tailwind = { config: { darkMode: 'class' } };
-  </script>
+  <script> tailwind = { config: { darkMode: 'class' } }; </script>
   <script src="https://cdn.tailwindcss.com"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <script>
-    function toggleDarkMode() { document.documentElement.classList.toggle("dark"); }
-  </script>
+  <script> function toggleDarkMode() { document.documentElement.classList.toggle("dark"); } </script>
 </head>
 <body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100 min-h-screen">
   <div class="max-w-4xl mx-auto p-4">
@@ -370,9 +386,7 @@ def index():
         </select>
       </div>
       <div class="flex items-center space-x-4">
-        <button type="button" id="uploadButton" onclick="submitForm()" class="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition disabled:opacity-50">
-          Upload
-        </button>
+        <button type="button" id="uploadButton" onclick="submitForm()" class="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition disabled:opacity-50">Upload</button>
         <div id="uploadProgress" class="hidden">
           <div class="w-64 bg-gray-200 dark:bg-gray-700 rounded">
             <div id="progressBar" class="h-2 bg-green-500 rounded" style="width: 0%"></div>
@@ -406,7 +420,7 @@ def index():
     function computeQueueEtas(jobsArr) {
       let cumulative = 0, totalQueueTime = 0;
       for (let j of jobsArr) {
-        if (["done","failed","cancelled"].includes(j.status)) { j.etaFromNow = 0; continue; }
+        if (["done", "failed", "cancelled"].includes(j.status)) { j.etaFromNow = 0; continue; }
         if (j.status === "processing") { cumulative = j.eta || 0; j.etaFromNow = cumulative; }
         else { cumulative += (j.estimated_time || 0); j.etaFromNow = cumulative; }
         totalQueueTime = Math.max(totalQueueTime, j.etaFromNow);
@@ -455,7 +469,7 @@ def index():
                      <button onclick="removeJob('${job.id}')" class="mt-2 px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700">Remove Job</button>
                    </div>`;
         }
-        if (["failed","cancelled"].includes(job.status)) {
+        if (["failed", "cancelled"].includes(job.status)) {
           if (job.error) html += `<div class="mt-2 text-red-400"><strong>Error:</strong> ${job.error}</div>`;
           html += `<div>
                      <button onclick="removeJob('${job.id}')" class="mt-2 px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700">Remove Job</button>
@@ -608,13 +622,11 @@ def restart_job(job_id: str):
     job = jobs[job_id]
     if job["status"] not in ("failed", "cancelled"):
         raise HTTPException(status_code=400, detail="Only failed or cancelled jobs can be restarted.")
-    # Reset job state
     job["status"] = "pending"
     job["error"] = None
     job["progress"] = 0
     job["eta"] = None
     save_job_metadata(job_id, job)
-    # Requeue the job for processing
     job_queue.put({
         "job_id": job_id,
         "file_location": job["input_file"],
