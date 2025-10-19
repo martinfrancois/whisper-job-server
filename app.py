@@ -202,7 +202,23 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
     job_dir = os.path.join(JOB_BASE, job_id)
     job_input_file = os.path.join(job_dir, "input.wav")
     try:
-        shutil.copy(input_file_path, job_input_file)
+        try:
+            # Convert any incoming media to a mono 16 kHz WAV so downstream
+            # pipelines (e.g., pyannote) always receive a supported format.
+            (
+                ffmpeg
+                .input(input_file_path)
+                .output(job_input_file, ac=1, ar=16000, format="wav")
+                .run(overwrite_output=True, quiet=True)
+            )
+        except ffmpeg.Error as ffmpeg_err:
+            logger.error(
+                "FFmpeg conversion failed for %s: %s",
+                input_file_path,
+                ffmpeg_err,
+                exc_info=True,
+            )
+            raise
         model = whisper.load_model("large-v2")
         logger.info("Whisper model loaded in process_job")
         if mode == "one":

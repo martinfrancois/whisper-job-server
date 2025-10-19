@@ -123,8 +123,10 @@ Run the command in a terminal window.
 For speaker detection mode:
 
 1. Create an account on [Hugging Face](https://huggingface.co/).
-2. Accept the license for `pyannote/speaker-diarization`.
+2. Accept the license for `pyannote/speaker-diarization` and `pyannote/segmentation`.
 3. Generate an access token from [Hugging Face Settings](https://huggingface.co/settings/tokens).
+   - Choose `Fine-grained`
+   - Under `Repositories permissions`, search for `pyannote/speaker-diarization` and `pyannote/segmentation` and give permission for `Read access to contents of selected repos`
 4. Set the token as an environment variable:
 
    ```bash
