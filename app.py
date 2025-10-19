@@ -48,13 +48,30 @@ job_queue = Queue()
 processing_lock = threading.Lock()
 
 # ------------------------------------------------------
+# Runtime history tracking for improved ETA predictions
+# ------------------------------------------------------
+RUNTIME_HISTORY_FILE = "runtime_history.json"
+runtime_history_lock = threading.Lock()
+runtime_history = {}
+
+# Baseline ratios are used until enough history is gathered.
+DEFAULT_SPEED_RATIOS = {
+    "one": 1.0,
+    "stereo": 1.2,
+    "diarization": 3.0,
+}
+HISTORY_SMOOTHING = 0.25  # exponential moving average factor
+HISTORY_MAX_OBSERVATIONS = 100
+
+# ------------------------------------------------------
 # Helper: Save job metadata to file (filtering out ephemeral keys)
 # ------------------------------------------------------
 def save_job_metadata(job_id, job_info):
     job_dir = os.path.join(JOB_BASE, job_id)
     metadata_file = os.path.join(job_dir, "job_metadata.json")
     # Do not persist ephemeral fields such as "progress" and "eta"
-    filtered_info = {k: v for k, v in job_info.items() if k not in ("progress", "eta")}
+    ephemeral_keys = {"progress", "eta", "progress_strategy", "segments_total", "segments_completed"}
+    filtered_info = {k: v for k, v in job_info.items() if k not in ephemeral_keys}
     try:
         with open(metadata_file, "w", encoding="utf-8") as f:
             json.dump(filtered_info, f)
@@ -105,6 +122,79 @@ def load_jobs_from_disk():
                 job_info["error"] = "Job did not complete before server restart."
             jobs_dict[job_id] = job_info
     return jobs_dict
+
+# ------------------------------------------------------
+# Runtime history helpers
+# ------------------------------------------------------
+def _runtime_history_key(mode: str, language: str) -> str:
+    mode_part = (mode or "").lower() or "unknown"
+    lang_part = (language or "").lower() or "und"
+    return f"{mode_part}::{lang_part}"
+
+
+def load_runtime_history():
+    global runtime_history
+    if not os.path.exists(RUNTIME_HISTORY_FILE):
+        runtime_history = {}
+        return
+    try:
+        with open(RUNTIME_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            runtime_history = data
+        else:
+            runtime_history = {}
+    except Exception as exc:
+        runtime_history = {}
+        logger.error(f"Failed to load runtime history: {exc}", exc_info=True)
+
+
+def save_runtime_history():
+    try:
+        with runtime_history_lock:
+            snapshot = dict(runtime_history)
+        tmp_path = f"{RUNTIME_HISTORY_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_path, RUNTIME_HISTORY_FILE)
+    except Exception as exc:
+        logger.error(f"Failed to persist runtime history: {exc}", exc_info=True)
+
+
+def estimate_runtime_seconds(duration_sec: float, mode: str, language: str) -> float:
+    if duration_sec <= 0:
+        return 0.0
+    key = _runtime_history_key(mode, language)
+    with runtime_history_lock:
+        entry = runtime_history.get(key)
+    ratio = None
+    if entry:
+        ratio = entry.get("avg_ratio")
+    if not ratio or ratio <= 0:
+        ratio = DEFAULT_SPEED_RATIOS.get((mode or "").lower(), 1.0)
+    return max(duration_sec * ratio, duration_sec)
+
+
+def record_runtime_sample(mode: str, language: str, audio_duration: float, actual_runtime: float):
+    if audio_duration <= 0 or actual_runtime <= 0:
+        return
+    ratio = actual_runtime / audio_duration
+    key = _runtime_history_key(mode, language)
+    with runtime_history_lock:
+        entry = runtime_history.get(key, {})
+        count = entry.get("count", 0)
+        avg_ratio = entry.get("avg_ratio")
+        if not avg_ratio or count == 0:
+            new_avg = ratio
+        else:
+            new_avg = HISTORY_SMOOTHING * ratio + (1 - HISTORY_SMOOTHING) * avg_ratio
+        new_count = min(count + 1, HISTORY_MAX_OBSERVATIONS)
+        runtime_history[key] = {"avg_ratio": new_avg, "count": new_count}
+    save_runtime_history()
+
+
+# Load persisted runtime history at import time.
+load_runtime_history()
 
 # ------------------------------------------------------
 # Utility: Get audio duration via ffmpeg
@@ -173,8 +263,13 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
     job_info = dict(shared_jobs[job_id])
     job_language = (language or job_info.get("language") or "en").lower()
     estimated_transcription_time = job_info.get("estimated_time", 0.0)
+    job_audio_duration = job_info.get("audio_duration", 0.0)
+    if (estimated_transcription_time <= 0) and job_audio_duration:
+        estimated_transcription_time = estimate_runtime_seconds(job_audio_duration, mode, job_language)
+        job_info["estimated_time"] = estimated_transcription_time
     job_info["status"] = "processing"
     job_info["language"] = job_language
+    job_info["progress_strategy"] = "elapsed"
     shared_jobs[job_id] = job_info
     save_job_metadata(job_id, job_info)
     start_time = time.time()
@@ -188,7 +283,9 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
                 return
             elapsed = time.time() - start_time
             fraction = min(elapsed / estimated_transcription_time if estimated_transcription_time > 0 else 0.0, 1.0)
-            current_info["progress"] = int(fraction * 100)
+            strategy = current_info.get("progress_strategy", "elapsed")
+            if strategy == "elapsed":
+                current_info["progress"] = int(fraction * 100)
             current_info["eta"] = max(int(estimated_transcription_time - elapsed), 0)
             shared_jobs[job_id] = current_info
             # Ephemeral fields are not saved to disk.
@@ -246,9 +343,18 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
                     "speaker": speaker
                 })
             diar_segs.sort(key=lambda x: x["start"])
+            total_segments = len(diar_segs)
+            current_info = dict(shared_jobs[job_id])
+            current_info["progress_strategy"] = "segments"
+            current_info["segments_total"] = total_segments
+            current_info["segments_completed"] = 0
+            if total_segments == 0:
+                current_info["progress"] = 100
+            shared_jobs[job_id] = current_info
             speaker_map = {}
             next_speaker = 1
             global_segments = []
+            segments_completed = 0
             for i, seg in enumerate(diar_segs):
                 seg_start, seg_end, orig_spk = seg["start"], seg["end"], seg["speaker"]
                 if orig_spk not in speaker_map:
@@ -270,6 +376,13 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
                         "speaker": spk_label,
                         "text": text
                     })
+                segments_completed += 1
+                if total_segments > 0:
+                    progress_fraction = min(segments_completed / total_segments, 1.0)
+                    current_info = dict(shared_jobs[job_id])
+                    current_info["segments_completed"] = segments_completed
+                    current_info["progress"] = int(progress_fraction * 100)
+                    shared_jobs[job_id] = current_info
             global_segments.sort(key=lambda x: x["start"])
             merged_plain, merged_ts = [], []
             for seg in global_segments:
@@ -295,6 +408,10 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
         })
         shared_jobs[job_id] = final_info
         save_job_metadata(job_id, final_info)
+        actual_runtime = time.time() - start_time
+        if not job_audio_duration:
+            job_audio_duration = get_audio_duration(job_input_file)
+        record_runtime_sample(mode, job_language, job_audio_duration, actual_runtime)
         logger.info(f"Job {job_id} completed successfully.")
     except Exception as e:
         logger.error(f"Error in job {job_id}: {str(e)}", exc_info=True)
@@ -622,8 +739,7 @@ async def upload_file(
         content = await file.read()
         f.write(content)
     duration_sec = get_audio_duration(file_location)
-    speed_ratio = 1.0
-    estimated_time = duration_sec * speed_ratio
+    estimated_time = estimate_runtime_seconds(duration_sec, mode, selected_language)
     job_info = {
         "status": "pending",
         "input_file": file_location,
@@ -660,6 +776,12 @@ def restart_job(job_id: str):
     job["error"] = None
     job["progress"] = 0
     job["eta"] = None
+    audio_duration = job.get("audio_duration") or get_audio_duration(job.get("input_file", ""))
+    job["estimated_time"] = estimate_runtime_seconds(
+        audio_duration,
+        job.get("mode"),
+        (job.get("language") or "en"),
+    )
     save_job_metadata(job_id, job)
     job_queue.put({
         "job_id": job_id,
