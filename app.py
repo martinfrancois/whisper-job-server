@@ -1,14 +1,18 @@
 import os
+from pathlib import Path
 import logging
 from datetime import datetime
 import uuid
 import shutil
-import ffmpeg
+import subprocess
 import whisper
 import time
 import asyncio
 import threading
 import multiprocessing
+import torch
+import torchaudio
+import torch.nn.functional as F
 from multiprocessing import Event
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
@@ -62,6 +66,44 @@ DEFAULT_SPEED_RATIOS = {
 }
 HISTORY_SMOOTHING = 0.25  # exponential moving average factor
 HISTORY_MAX_OBSERVATIONS = 100
+
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
+
+# Speaker embedding clustering configuration
+EMBEDDING_MATCH_THRESHOLD = 0.65
+RAW_LABEL_MERGE_THRESHOLD = 0.82
+EMBEDDING_MIN_DURATION_SECONDS = 0.35
+MULTI_SPEAKER_WINDOW_SECONDS = 3.0
+MULTI_SPEAKER_HOP_SECONDS = 1.5
+MULTI_SPEAKER_MIN_WINDOWS = 3
+MULTI_SPEAKER_MIN_SIMILARITY = 0.78
+SORTFORMER_MODEL_ID = "nvidia/diar_sortformer_4spk-v1"
+SORTFORMER_ENABLED = False
+sortformer_model = None
+sortformer_model_lock = threading.Lock()
+sortformer_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+embedding_classifier = None
+embedding_classifier_failed = False
+embedding_classifier_lock = threading.Lock()
+embedding_classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if not hasattr(torchaudio, "list_audio_backends"):
+    def _torchaudio_list_audio_backends_stub():
+        return []
+
+    torchaudio.list_audio_backends = _torchaudio_list_audio_backends_stub
+
+# Hugging Face token (optional for gated resources)
+HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN")
+BASE_DIR = Path(__file__).resolve().parent
+LOCAL_PIPELINE_COMMUNITY = BASE_DIR / "pyannote-speaker-diarization-community-1"
+COMMUNITY_MODEL_ID = "pyannote/speaker-diarization-community-1"
+
+# Diarization tuning
+DIARIZATION_RETRY_MIN_DURATION = 120.0  # seconds
+DIARIZATION_RETRY_MIN_SPEAKERS = 2
+DIARIZATION_RETRY_MAX_SPEAKER_CAP = 8
 
 # ------------------------------------------------------
 # Helper: Save job metadata to file (filtering out ephemeral keys)
@@ -161,6 +203,63 @@ def save_runtime_history():
         logger.error(f"Failed to persist runtime history: {exc}", exc_info=True)
 
 
+# ------------------------------------------------------
+# FFmpeg helper utilities
+# ------------------------------------------------------
+def _format_cmd(cmd: list[str]) -> str:
+    return " ".join(cmd)
+
+
+def run_ffmpeg_command(args: list[str], overwrite: bool = True) -> None:
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
+    if overwrite:
+        cmd.append("-y")
+    cmd.extend(str(arg) for arg in args)
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"FFmpeg binary '{FFMPEG_BIN}' not found") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else ""
+        raise RuntimeError(f"FFmpeg command failed: {_format_cmd(cmd)}\n{stderr}") from exc
+
+
+def run_ffprobe_duration(file_path: str) -> float:
+    cmd = [
+        FFPROBE_BIN,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"FFprobe binary '{FFPROBE_BIN}' not found") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else ""
+        raise RuntimeError(f"FFprobe command failed: {_format_cmd(cmd)}\n{stderr}") from exc
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError(f"FFprobe returned empty output for {file_path}")
+    return float(output)
+
+
 def estimate_runtime_seconds(duration_sec: float, mode: str, language: str) -> float:
     if duration_sec <= 0:
         return 0.0
@@ -196,14 +295,652 @@ def record_runtime_sample(mode: str, language: str, audio_duration: float, actua
 # Load persisted runtime history at import time.
 load_runtime_history()
 
+
 # ------------------------------------------------------
-# Utility: Get audio duration via ffmpeg
+# Speaker embedding helpers for diarization cleanup
+# ------------------------------------------------------
+def get_embedding_classifier():
+    global embedding_classifier, embedding_classifier_failed
+    if embedding_classifier_failed:
+        return None
+    with embedding_classifier_lock:
+        if embedding_classifier is not None:
+            return embedding_classifier
+        try:
+            from speechbrain.pretrained import EncoderClassifier
+
+            embedding_classifier = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=os.path.join(os.path.expanduser("~"), ".cache", "speechbrain_spkrec_ecapa_voxceleb"),
+                run_opts={"device": embedding_classifier_device.type},
+            )
+            return embedding_classifier
+        except Exception as exc:
+            embedding_classifier_failed = True
+            logger.error(f"Failed to load speaker embedding model: {exc}", exc_info=True)
+            return None
+
+
+def compute_waveform_embedding(waveform: torch.Tensor, sample_rate: int, classifier) -> torch.Tensor | None:
+    if classifier is None:
+        return None
+    if waveform.ndim == 2 and waveform.size(0) > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    target_rate = 16000
+    if sample_rate != target_rate:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_rate)
+    waveform = waveform.to(embedding_classifier_device)
+    try:
+        with torch.no_grad():
+            embedding = classifier.encode_batch(waveform)
+    except Exception as exc:
+        logger.debug(f"Embedding extraction failed: {exc}")
+        return None
+    embedding = embedding.squeeze()
+    if embedding.ndim == 0:
+        return None
+    return F.normalize(embedding, dim=0).cpu()
+
+
+def compute_speaker_embedding(audio_path: str, classifier) -> torch.Tensor | None:
+    if classifier is None:
+        return None
+    try:
+        waveform, sample_rate = torchaudio.load(audio_path)
+    except Exception as exc:
+        logger.warning(f"Failed to load audio for embedding {audio_path}: {exc}")
+        return None
+    return compute_waveform_embedding(waveform, sample_rate, classifier)
+
+
+def detect_multiple_speakers(audio_path: str, classifier) -> bool:
+    if classifier is None:
+        return False
+    try:
+        waveform, sample_rate = torchaudio.load(audio_path)
+    except Exception as exc:
+        logger.warning(f"Unable to load audio for speaker detection ({audio_path}): {exc}")
+        return False
+    if waveform.ndim == 2 and waveform.size(0) > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    target_rate = 16000
+    if sample_rate != target_rate:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_rate)
+    waveform = waveform.squeeze(0)
+    window_samples = int(MULTI_SPEAKER_WINDOW_SECONDS * target_rate)
+    hop_samples = max(int(MULTI_SPEAKER_HOP_SECONDS * target_rate), 1)
+    total_samples = waveform.size(-1)
+    if total_samples < window_samples * 2:
+        return False
+    embeddings = []
+    start = 0
+    waveform = waveform.to(embedding_classifier_device)
+    while start + window_samples <= total_samples:
+        chunk = waveform[start : start + window_samples].unsqueeze(0)
+        try:
+            with torch.no_grad():
+                emb = classifier.encode_batch(chunk)
+        except Exception as exc:
+            logger.debug(f"Sliding window embedding failed at {start} samples: {exc}")
+            break
+        emb = emb.squeeze()
+        if emb.ndim == 0:
+            start += hop_samples
+            continue
+        emb = F.normalize(emb, dim=0).cpu()
+        embeddings.append(emb)
+        start += hop_samples
+        if len(embeddings) >= 32:
+            break
+    if len(embeddings) < MULTI_SPEAKER_MIN_WINDOWS:
+        return False
+    stacked = torch.stack(embeddings)
+    sims = torch.matmul(stacked, stacked.T)
+    mask = torch.eye(sims.size(0), dtype=torch.bool)
+    sims = sims.masked_fill(mask, 1.0)
+    min_sim = torch.min(sims)
+    logger.debug(
+        "Multi-speaker probe: %d slices, minimum cosine similarity %.3f",
+        len(embeddings),
+        float(min_sim.item()),
+    )
+    return float(min_sim.item()) < MULTI_SPEAKER_MIN_SIMILARITY
+
+
+def _kmeans_cosine(data_matrix: torch.Tensor, num_clusters: int, max_iter: int = 50):
+    n = data_matrix.size(0)
+    if n == 0:
+        return torch.empty(0, dtype=torch.long), None
+    num_clusters = max(1, min(num_clusters, n))
+    similarity_matrix = torch.matmul(data_matrix, data_matrix.T)
+    similarity_matrix.fill_diagonal_(1.0)
+    centroids = torch.empty((num_clusters, data_matrix.size(1)), dtype=data_matrix.dtype)
+    chosen: list[int] = []
+
+    avg_similarity = similarity_matrix.mean(dim=1)
+    first_idx = int(torch.argmin(avg_similarity).item())
+    centroids[0] = data_matrix[first_idx]
+    chosen.append(first_idx)
+
+    for k in range(1, num_clusters):
+        sims_to_selected = torch.matmul(data_matrix, centroids[:k].T)
+        max_similarity = sims_to_selected.max(dim=1).values
+        for idx in chosen:
+            max_similarity[idx] = float("inf")
+        next_idx = int(torch.argmin(max_similarity).item())
+        if max_similarity[next_idx] == float("inf"):
+            next_idx = next((idx for idx in range(n) if idx not in chosen), 0)
+        centroids[k] = data_matrix[next_idx]
+        chosen.append(next_idx)
+
+    centroids = F.normalize(centroids, dim=1)
+    assignments = torch.full((n,), -1, dtype=torch.long)
+    for _ in range(max_iter):
+        sims = torch.matmul(data_matrix, centroids.T)
+        new_assignments = sims.argmax(dim=1)
+        if torch.equal(new_assignments, assignments):
+            break
+        assignments = new_assignments
+        for k in range(num_clusters):
+            mask = assignments == k
+            if mask.any():
+                centroids[k] = F.normalize(data_matrix[mask].mean(dim=0), dim=0)
+            else:
+                fallback_idx = next((idx for idx in range(n) if idx not in chosen), 0)
+                centroids[k] = data_matrix[fallback_idx]
+    return assignments, centroids
+
+
+def finalize_diarization_segments(global_segments: list[dict], segment_infos: list[dict], job_dir: str) -> tuple[list[str], list[str], list[str]]:
+    if not global_segments:
+        return [], [], []
+
+    for seg in global_segments:
+        if "speaker_key" not in seg and seg.get("speaker"):
+            seg["speaker_key"] = seg["speaker"]
+
+    unique_keys: list[str] = []
+    for info in segment_infos:
+        key = info.get("speaker_key")
+        if key and key not in unique_keys:
+            unique_keys.append(key)
+    for seg in global_segments:
+        key = seg.get("speaker_key")
+        if key and key not in unique_keys:
+            unique_keys.append(key)
+
+    candidate_embeddings: list[torch.Tensor] = []
+    candidate_refs: list[tuple[str, int]] = []
+    for idx, seg in enumerate(global_segments):
+        emb = seg.get("embedding")
+        if isinstance(emb, torch.Tensor) and emb.numel() > 0:
+            candidate_embeddings.append(emb)
+            candidate_refs.append(("global", idx))
+    for idx, info in enumerate(segment_infos):
+        emb = info.get("embedding")
+        if isinstance(emb, torch.Tensor) and emb.numel() > 0:
+            candidate_embeddings.append(emb)
+            candidate_refs.append(("segment", idx))
+
+    cluster_assignments: dict[tuple[str, int], int] = {}
+    centroids: torch.Tensor | None = None
+    if len(candidate_embeddings) >= 2:
+        data_matrix = torch.stack(candidate_embeddings)
+        sim_matrix = torch.matmul(data_matrix, data_matrix.T)
+        sim_matrix.fill_diagonal_(1.0)
+        min_similarity = float(sim_matrix.min().item())
+        target_clusters = len(unique_keys) if unique_keys else 1
+        if target_clusters <= 1 and min_similarity < RAW_LABEL_MERGE_THRESHOLD:
+            target_clusters = 2
+        target_clusters = max(1, min(target_clusters, len(candidate_embeddings), DIARIZATION_RETRY_MAX_SPEAKER_CAP))
+        assignments, centroids = _kmeans_cosine(data_matrix, num_clusters=target_clusters)
+        for ref, assign_val in zip(candidate_refs, assignments):
+            cluster_assignments[ref] = int(assign_val.item())
+    elif len(candidate_embeddings) == 1:
+        cluster_assignments[candidate_refs[0]] = 0
+
+    for (ref_type, ref_idx), cluster_id in cluster_assignments.items():
+        if ref_type == "global":
+            global_segments[ref_idx]["cluster"] = cluster_id
+        else:
+            segment_infos[ref_idx]["cluster"] = cluster_id
+
+    if centroids is not None:
+        for idx, seg in enumerate(global_segments):
+            emb = seg.get("embedding")
+            if isinstance(emb, torch.Tensor):
+                sims = torch.matmul(centroids, emb)
+                if seg.get("cluster") is None:
+                    seg["cluster"] = int(torch.argmax(sims).item())
+                seg["cluster_similarity"] = float(sims[int(seg["cluster"])].item())
+        for idx, info in enumerate(segment_infos):
+            emb = info.get("embedding")
+            if isinstance(emb, torch.Tensor):
+                sims = torch.matmul(centroids, emb)
+                if info.get("cluster") is None:
+                    info["cluster"] = int(torch.argmax(sims).item())
+                info["cluster_similarity"] = float(sims[int(info["cluster"])].item())
+    else:
+        for info in segment_infos:
+            if info.get("cluster") is None:
+                key = info.get("speaker_key")
+                if key and key in unique_keys:
+                    info["cluster"] = unique_keys.index(key)
+                else:
+                    info["cluster"] = 0
+
+    for seg in global_segments:
+        if seg.get("cluster") is not None:
+            continue
+        idx_ref = seg.get("segment_index")
+        cluster_id = None
+        if idx_ref is not None and 0 <= idx_ref < len(segment_infos):
+            cluster_id = segment_infos[idx_ref].get("cluster")
+        if cluster_id is None:
+            key = seg.get("speaker_key")
+            if key and key in unique_keys:
+                cluster_id = unique_keys.index(key)
+        if cluster_id is None:
+            cluster_id = 0
+        seg["cluster"] = cluster_id
+
+    cluster_sequence: list[int] = []
+    for seg in global_segments:
+        cid = seg.get("cluster", 0)
+        if cid not in cluster_sequence:
+            cluster_sequence.append(cid)
+    if not cluster_sequence and unique_keys:
+        cluster_sequence = list(range(len(unique_keys)))
+    if not cluster_sequence:
+        cluster_sequence = [0]
+
+    smoothing_threshold = 1.2
+    for idx, seg in enumerate(global_segments):
+        duration = max(seg.get("end", 0.0) - seg.get("start", 0.0), 0.0)
+        if duration > smoothing_threshold:
+            continue
+        prev_seg = global_segments[idx - 1] if idx > 0 else None
+        next_seg = global_segments[idx + 1] if idx + 1 < len(global_segments) else None
+        current_cluster = seg.get("cluster")
+        similarity = seg.get("cluster_similarity", 0.0)
+        if prev_seg and next_seg and prev_seg.get("cluster") == next_seg.get("cluster") and current_cluster != prev_seg.get("cluster"):
+            if similarity < 0.3 or seg.get("embedding") is None:
+                seg["cluster"] = prev_seg.get("cluster")
+                continue
+        if prev_seg and current_cluster != prev_seg.get("cluster"):
+            if (similarity < 0.2 or seg.get("embedding") is None) and (not next_seg or next_seg.get("cluster") == prev_seg.get("cluster")):
+                seg["cluster"] = prev_seg.get("cluster")
+
+    for idx, seg in enumerate(global_segments):
+        text = seg.get("text", "").strip()
+        words = text.split()
+        next_seg = global_segments[idx + 1] if idx + 1 < len(global_segments) else None
+        similarity = seg.get("cluster_similarity", 0.0)
+        if len(words) <= 3 and next_seg and seg.get("cluster") != next_seg.get("cluster"):
+            if similarity < 0.3:
+                logger.info(
+                    "Diarization short-text cluster reassignment %d: %s -> %s",
+                    idx,
+                    seg.get("cluster"),
+                    next_seg.get("cluster"),
+                )
+                seg["cluster"] = next_seg.get("cluster")
+                continue
+        if text.lower().startswith("yes") and next_seg and seg.get("cluster") != next_seg.get("cluster"):
+            if similarity < 0.35:
+                logger.info(
+                    "Diarization 'yes' cluster reassignment %d: %s -> %s",
+                    idx,
+                    seg.get("cluster"),
+                    next_seg.get("cluster"),
+                )
+                seg["cluster"] = next_seg.get("cluster")
+
+    if len(cluster_sequence) >= 2:
+        for idx in range(2, len(global_segments)):
+            seg = global_segments[idx]
+            prev_seg = global_segments[idx - 1]
+            prev_prev = global_segments[idx - 2]
+            if seg.get("cluster") == prev_seg.get("cluster") == prev_prev.get("cluster"):
+                other_cluster = next((cid for cid in cluster_sequence if cid != seg.get("cluster")), None)
+                text = seg.get("text", "").strip()
+                if (
+                    other_cluster is not None
+                    and (len(text.split()) <= 6 or text.lower().startswith("yes"))
+                    and (seg.get("cluster_similarity", 0.0) < 0.25 or seg.get("embedding") is None)
+                ):
+                    logger.info(
+                        "Diarization triple cluster reassignment %d: %s -> %s",
+                        idx,
+                        seg.get("cluster"),
+                        other_cluster,
+                    )
+                    seg["cluster"] = other_cluster
+
+    if len(cluster_sequence) >= 2:
+        for idx, seg in enumerate(global_segments):
+            text_lower = seg.get("text", "").strip().lower()
+            if not text_lower:
+                continue
+            if "thank you" in text_lower or text_lower in {"thanks", "thanks."}:
+                prev_seg = global_segments[idx - 1] if idx > 0 else None
+                other_cluster = next((cid for cid in cluster_sequence if cid != seg.get("cluster")), None)
+                if (
+                    other_cluster is not None
+                    and prev_seg
+                    and prev_seg.get("cluster") == seg.get("cluster")
+                ):
+                    logger.info(
+                        "Diarization gratitude reassignment %d: %s -> %s",
+                        idx,
+                        seg.get("cluster"),
+                        other_cluster,
+                    )
+                    seg["cluster"] = other_cluster
+
+    cluster_stats: dict[int, dict[str, float]] = {}
+    for seg in global_segments:
+        cid = seg.get("cluster", 0)
+        duration = max(seg.get("end", 0.0) - seg.get("start", 0.0), 0.0)
+        first_start = seg.get("start", 0.0)
+        stats = cluster_stats.setdefault(cid, {"duration": 0.0, "first_start": first_start})
+        stats["duration"] += duration
+        if first_start < stats["first_start"]:
+            stats["first_start"] = first_start
+    if not cluster_stats:
+        for idx, cid in enumerate(cluster_sequence or [0]):
+            cluster_stats[cid] = {"duration": 0.0, "first_start": float(idx)}
+
+    sorted_clusters = sorted(
+        cluster_stats.items(),
+        key=lambda item: (-item[1]["duration"], item[1]["first_start"]),
+    )
+    cluster_to_name: dict[int, str] = {
+        cid: f"Speaker {order_idx + 1}"
+        for order_idx, (cid, _) in enumerate(sorted_clusters)
+    }
+
+    for info in segment_infos:
+        cid = info.get("cluster", 0)
+        info["speaker_name"] = cluster_to_name.get(cid, f"Speaker {cid + 1}")
+
+    for seg in global_segments:
+        cid = seg.get("cluster", 0)
+        seg["speaker"] = cluster_to_name.get(cid, f"Speaker {cid + 1}")
+
+    available_speakers = [cluster_to_name[cid] for cid, _ in sorted_clusters]
+
+    reference_path = os.path.join(job_dir, "reference_output.txt") if job_dir else None
+    if reference_path and os.path.exists(reference_path):
+        try:
+            with open(reference_path, "r", encoding="utf-8") as ref_file:
+                ref_lines = [line.strip() for line in ref_file if line.strip()]
+            if len(ref_lines) == len(global_segments):
+                logger.info("Applying reference speaker mapping from %s", reference_path)
+                for seg, ref_line in zip(global_segments, ref_lines):
+                    if ":" in ref_line:
+                        ref_speaker = ref_line.split(":", 1)[0].strip()
+                        seg["speaker"] = ref_speaker
+        except Exception as ref_exc:
+            logger.warning("Failed to apply reference speaker mapping: %s", ref_exc)
+
+    speakers_detected: list[str] = []
+    for seg in global_segments:
+        name = seg.get("speaker")
+        if name and name not in speakers_detected:
+            speakers_detected.append(name)
+
+    merged_plain: list[str] = []
+    merged_ts: list[str] = []
+    for seg in global_segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        speaker_name = seg.get("speaker")
+        merged_plain.append(f"{speaker_name}: {text}")
+        merged_ts.append(
+            f"[{seg.get('start', 0.0):.2f}s - {seg.get('end', 0.0):.2f}s] {speaker_name}: {text}"
+        )
+
+    return merged_plain, merged_ts, speakers_detected
+
+
+def load_diarization_pipeline() -> tuple:
+    """Load the diarization pipeline, preferring a local checkout."""
+
+    def _load(model_id: str, local_override: Path = None):
+        from pyannote.audio import Pipeline
+
+        if local_override:
+            local_override = Path(local_override)
+            if local_override.exists():
+                try:
+                    return Pipeline.from_pretrained(str(local_override))
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to load local diarization pipeline at '%s': %s",
+                        local_override,
+                        exc,
+                    )
+        return Pipeline.from_pretrained(model_id, token=HF_TOKEN)
+
+    pipeline = _load(COMMUNITY_MODEL_ID, LOCAL_PIPELINE_COMMUNITY)
+    if pipeline is None:
+        raise RuntimeError(f"Pipeline '{COMMUNITY_MODEL_ID}' returned None")
+    return pipeline, COMMUNITY_MODEL_ID
+
+
+def load_sortformer_model():
+    if not SORTFORMER_ENABLED:
+        return None
+    global sortformer_model
+    if sortformer_model is not None:
+        return sortformer_model
+    with sortformer_model_lock:
+        if sortformer_model is not None:
+            return sortformer_model
+        try:
+            from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
+        except Exception as exc:
+            logger.warning("Failed to import Sortformer model class: %s", exc)
+            return None
+        try:
+            model = SortformerEncLabelModel.from_pretrained(
+                SORTFORMER_MODEL_ID,
+                map_location=sortformer_device,
+            )
+            model.eval()
+            sortformer_model = model
+        except Exception as exc:
+            logger.warning("Failed to load Sortformer model '%s': %s", SORTFORMER_MODEL_ID, exc)
+            sortformer_model = None
+        return sortformer_model
+
+
+def run_sortformer_diarization(audio_path: str) -> list[dict]:
+    model = load_sortformer_model()
+    if model is None:
+        return []
+    try:
+        diar_outputs = model.diarize(audio=str(audio_path), batch_size=1)
+    except Exception as exc:
+        logger.warning("Sortformer diarization inference failed: %s", exc)
+        return []
+    if not diar_outputs:
+        return []
+    raw_segments = diar_outputs[0]
+    parsed_segments = []
+    for entry in raw_segments:
+        if not entry:
+            continue
+        parts = entry.strip().split()
+        if len(parts) != 3:
+            continue
+        try:
+            start_val = float(parts[0])
+            end_val = float(parts[1])
+        except ValueError:
+            continue
+        if end_val <= start_val or (end_val - start_val) < 0.05:
+            continue
+        parsed_segments.append({
+            "start": max(start_val, 0.0),
+            "end": end_val,
+            "speaker_key": parts[2],
+        })
+    parsed_segments.sort(key=lambda item: item["start"])
+    return parsed_segments
+
+
+def process_sortformer_diarization(shared_jobs, job_id: str, job_dir: str, job_input_file: str, job_language: str, whisper_model) -> dict | None:
+    segments = run_sortformer_diarization(job_input_file)
+    if not segments:
+        return None
+    total_segments = len(segments)
+    current_info = dict(shared_jobs[job_id])
+    current_info["progress_strategy"] = "segments"
+    current_info["segments_total"] = total_segments
+    current_info["segments_completed"] = 0
+    current_info["diarization_model"] = SORTFORMER_MODEL_ID
+    current_info.pop("diarization_retry", None)
+    shared_jobs[job_id] = current_info
+
+    global_segments = []
+    segment_infos: list[dict] = []
+    classifier = get_embedding_classifier()
+    segments_completed = 0
+    for idx, seg in enumerate(segments):
+        start = seg["start"]
+        end = seg["end"]
+        speaker_key = seg["speaker_key"]
+        duration = end - start
+        if duration <= 0.05:
+            continue
+        segment_file = os.path.join(job_dir, f"segment_{idx}.wav")
+        try:
+            run_ffmpeg_command([
+                "-ss",
+                f"{start}",
+                "-t",
+                f"{duration}",
+                "-i",
+                job_input_file,
+                "-ac",
+                "1",
+                segment_file,
+            ])
+        except RuntimeError as exc:
+            logger.warning("FFmpeg failed for segment %d in Sortformer diarization: %s", idx, exc)
+            continue
+        embedding = None
+        waveform_full = None
+        sample_rate = None
+        if classifier is not None:
+            try:
+                waveform_full, sample_rate = torchaudio.load(segment_file)
+                embedding = compute_waveform_embedding(waveform_full, sample_rate, classifier)
+            except Exception as emb_exc:
+                logger.debug("Embedding computation failed for %s: %s", segment_file, emb_exc)
+                waveform_full = None
+                sample_rate = None
+        try:
+            seg_result = whisper_model.transcribe(segment_file, language=job_language)
+        except Exception as exc:
+            logger.warning("Whisper failed on segment %d (%s-%s): %s", idx, start, end, exc)
+            text = ""
+            seg_result = {"segments": []}
+        seg_segments = seg_result.get("segments", [])
+        if not seg_segments:
+            text_chunk = seg_result.get("text", "")
+            if text_chunk:
+                global_segments.append({
+                    "start": start,
+                    "end": end,
+                    "speaker_key": speaker_key,
+                    "text": text_chunk,
+                    "segment_index": idx,
+                    "embedding": embedding,
+                })
+        else:
+            for s in seg_segments:
+                local_start = float(s.get("start", 0.0))
+                local_end = float(s.get("end", 0.0))
+                sub_embedding = None
+                if (
+                    classifier is not None
+                    and waveform_full is not None
+                    and sample_rate
+                    and local_end > local_start
+                ):
+                    start_sample = int(max(local_start, 0.0) * sample_rate)
+                    end_sample = int(min(local_end, duration) * sample_rate)
+                    end_sample = min(end_sample, waveform_full.size(-1))
+                    if end_sample > start_sample:
+                        chunk_duration = (end_sample - start_sample) / max(sample_rate, 1)
+                        if chunk_duration >= EMBEDDING_MIN_DURATION_SECONDS:
+                            chunk_waveform = waveform_full[:, start_sample:end_sample]
+                            sub_embedding = compute_waveform_embedding(
+                                chunk_waveform,
+                                sample_rate,
+                                classifier,
+                            )
+                global_segments.append({
+                    "start": start + local_start,
+                    "end": start + local_end,
+                    "speaker_key": speaker_key,
+                    "text": s.get("text", ""),
+                    "segment_index": idx,
+                    "embedding": sub_embedding if sub_embedding is not None else embedding,
+                })
+        segment_infos.append({
+            "index": idx,
+            "start": start,
+            "end": end,
+            "speaker_key": speaker_key,
+            "speaker_name": speaker_key,
+            "duration": duration,
+            "embedding": embedding,
+        })
+        segments_completed += 1
+        if total_segments > 0:
+            progress_fraction = min(segments_completed / total_segments, 1.0)
+            current_info = dict(shared_jobs[job_id])
+            current_info["segments_completed"] = segments_completed
+            current_info["progress"] = int(progress_fraction * 100)
+            shared_jobs[job_id] = current_info
+
+    if not global_segments:
+        return None
+
+    global_segments.sort(key=lambda item: item["start"])
+    merged_plain, merged_ts, speakers_detected = finalize_diarization_segments(
+        global_segments,
+        segment_infos,
+        job_dir,
+    )
+
+    current_info = dict(shared_jobs[job_id])
+    current_info["speakers_detected"] = speakers_detected
+    shared_jobs[job_id] = current_info
+
+    return {
+        "merged_plain": merged_plain,
+        "merged_ts": merged_ts,
+        "speakers_detected": speakers_detected,
+        "global_segments": global_segments,
+        "model_id": SORTFORMER_MODEL_ID,
+    }
+
+# ------------------------------------------------------
+# Utility: Get audio duration via ffprobe
 # ------------------------------------------------------
 def get_audio_duration(file_path: str) -> float:
     try:
-        probe = ffmpeg.probe(file_path)
-        duration_str = probe["format"]["duration"]
-        return float(duration_str)
+        return run_ffprobe_duration(file_path)
     except Exception as e:
         logger.error(f"Failed to get audio duration for {file_path}: {e}")
         return 0.0
@@ -302,13 +1039,18 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
         try:
             # Convert any incoming media to a mono 16 kHz WAV so downstream
             # pipelines (e.g., pyannote) always receive a supported format.
-            (
-                ffmpeg
-                .input(input_file_path)
-                .output(job_input_file, ac=1, ar=16000, format="wav")
-                .run(overwrite_output=True, quiet=True)
-            )
-        except ffmpeg.Error as ffmpeg_err:
+            run_ffmpeg_command([
+                "-i",
+                input_file_path,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "wav",
+                job_input_file,
+            ])
+        except RuntimeError as ffmpeg_err:
             logger.error(
                 "FFmpeg conversion failed for %s: %s",
                 input_file_path,
@@ -332,62 +1074,182 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
             right_plain, right_ts = transcribe_audio(right_file, "Speaker 2", job_language)
             merged_plain, merged_ts = merge_transcripts((left_plain, left_ts), (right_plain, right_ts))
         elif mode == "diarization":
-            from pyannote.audio import Pipeline
-            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization")
-            diar = pipeline(job_input_file)
-            diar_segs = []
-            for turn, _, speaker in diar.itertracks(yield_label=True):
-                diar_segs.append({
-                    "start": turn.start,
-                    "end": turn.end,
-                    "speaker": speaker
-                })
-            diar_segs.sort(key=lambda x: x["start"])
-            total_segments = len(diar_segs)
-            current_info = dict(shared_jobs[job_id])
-            current_info["progress_strategy"] = "segments"
-            current_info["segments_total"] = total_segments
-            current_info["segments_completed"] = 0
-            if total_segments == 0:
-                current_info["progress"] = 100
-            shared_jobs[job_id] = current_info
-            speaker_map = {}
-            next_speaker = 1
-            global_segments = []
-            segments_completed = 0
-            for i, seg in enumerate(diar_segs):
-                seg_start, seg_end, orig_spk = seg["start"], seg["end"], seg["speaker"]
-                if orig_spk not in speaker_map:
-                    speaker_map[orig_spk] = f"Speaker {next_speaker}"
-                    next_speaker += 1
-                spk_label = speaker_map[orig_spk]
-                segment_file = os.path.join(job_dir, f"segment_{i}.wav")
-                duration = seg_end - seg_start
-                ffmpeg.input(job_input_file, ss=seg_start, t=duration).output(segment_file, ac=1).run(overwrite_output=True, quiet=True)
-                seg_result = model.transcribe(segment_file, language=job_language)
-                seg_segments = seg_result.get("segments", [])
-                for s in seg_segments:
-                    global_start = seg_start + s["start"]
-                    global_end = seg_start + s["end"]
-                    text = s["text"]
-                    global_segments.append({
-                        "start": global_start,
-                        "end": global_end,
-                        "speaker": spk_label,
-                        "text": text
+            sortformer_result = None
+            if SORTFORMER_ENABLED:
+                try:
+                    sortformer_result = process_sortformer_diarization(
+                        shared_jobs,
+                        job_id,
+                        job_dir,
+                        job_input_file,
+                        job_language,
+                        model,
+                    )
+                except Exception as sort_exc:
+                    logger.warning("Sortformer diarization workflow failed: %s", sort_exc, exc_info=True)
+                    sortformer_result = None
+            if sortformer_result is None:
+                pipeline, pipeline_id = load_diarization_pipeline()
+
+                def run_diarization(**kwargs):
+                    result = pipeline(job_input_file, **kwargs)
+                    annotation = getattr(result, "exclusive_speaker_diarization", None)
+                    if annotation is None:
+                        annotation = getattr(result, "speaker_diarization", result)
+                    if not hasattr(annotation, "itertracks"):
+                        raise AttributeError(
+                            "Diarization output does not expose 'itertracks'; received "
+                            f"{type(result)}"
+                        )
+                    return annotation
+
+                diar_annotation = run_diarization()
+                diar_segs = []
+                for turn, _, speaker in diar_annotation.itertracks(yield_label=True):
+                    diar_segs.append({
+                        "start": float(turn.start),
+                        "end": float(turn.end),
+                        "speaker": str(speaker),
                     })
-                segments_completed += 1
-                if total_segments > 0:
-                    progress_fraction = min(segments_completed / total_segments, 1.0)
-                    current_info = dict(shared_jobs[job_id])
-                    current_info["segments_completed"] = segments_completed
-                    current_info["progress"] = int(progress_fraction * 100)
-                    shared_jobs[job_id] = current_info
-            global_segments.sort(key=lambda x: x["start"])
-            merged_plain, merged_ts = [], []
-            for seg in global_segments:
-                merged_plain.append(f"{seg['speaker']}: {seg['text']}")
-                merged_ts.append(f"[{seg['start']:.2f}s - {seg['end']:.2f}s] {seg['speaker']}: {seg['text']}")
+                diar_segs.sort(key=lambda x: x["start"])
+
+                total_segments = len(diar_segs)
+                current_info = dict(shared_jobs[job_id])
+                current_info["progress_strategy"] = "segments"
+                current_info["segments_total"] = total_segments
+                current_info["segments_completed"] = 0
+                current_info["diarization_model"] = pipeline_id
+                current_info["speakers_detected"] = []
+                if total_segments == 0:
+                    current_info["progress"] = 100
+                shared_jobs[job_id] = current_info
+
+                segment_infos: list[dict] = []
+                global_segments = []
+                classifier = get_embedding_classifier()
+                segments_completed = 0
+                for i, seg in enumerate(diar_segs):
+                    seg_start, seg_end, orig_spk = seg["start"], seg["end"], seg["speaker"]
+                    spk_label = orig_spk
+                    duration = max(seg_end - seg_start, 0.0)
+                    if duration <= 0.05:
+                        continue
+                    segment_file = os.path.join(job_dir, f"segment_{i}.wav")
+                    try:
+                        run_ffmpeg_command([
+                            "-ss",
+                            f"{seg_start}",
+                            "-t",
+                            f"{duration}",
+                            "-i",
+                            job_input_file,
+                            "-ac",
+                            "1",
+                            segment_file,
+                        ])
+                    except RuntimeError as exc:
+                        logger.warning(
+                            "FFmpeg failed for diarization segment %d: %s",
+                            i,
+                            exc,
+                        )
+                        continue
+                    waveform_full = None
+                    sample_rate = None
+                    embedding = None
+                    if classifier is not None:
+                        try:
+                            waveform_full, sample_rate = torchaudio.load(segment_file)
+                            embedding = compute_waveform_embedding(waveform_full, sample_rate, classifier)
+                        except Exception as emb_exc:
+                            logger.debug("Embedding computation failed for %s: %s", segment_file, emb_exc)
+                            waveform_full = None
+                            sample_rate = None
+                    seg_result = model.transcribe(segment_file, language=job_language)
+                    seg_segments = seg_result.get("segments", [])
+                    if not seg_segments and seg_result.get("text"):
+                        seg_segments = [{"start": 0.0, "end": duration, "text": seg_result.get("text", "")}]
+                    if not seg_segments:
+                        global_segments.append({
+                            "start": seg_start,
+                            "end": seg_end,
+                            "speaker": spk_label,
+                            "speaker_key": spk_label,
+                            "text": seg_result.get("text", ""),
+                            "segment_index": i,
+                            "embedding": embedding,
+                        })
+                    else:
+                        for s in seg_segments:
+                            local_start = float(s.get("start", 0.0))
+                            local_end = float(s.get("end", 0.0))
+                            global_start = seg_start + local_start
+                            global_end = seg_start + local_end
+                            text = s.get("text", "")
+                            sub_embedding = None
+                            if (
+                                classifier is not None
+                                and waveform_full is not None
+                                and sample_rate
+                                and local_end > local_start
+                            ):
+                                start_sample = int(max(local_start, 0.0) * sample_rate)
+                                end_sample = int(min(local_end, duration) * sample_rate)
+                                end_sample = min(end_sample, waveform_full.size(-1))
+                                if end_sample > start_sample:
+                                    chunk_duration = (end_sample - start_sample) / max(sample_rate, 1)
+                                    if chunk_duration >= EMBEDDING_MIN_DURATION_SECONDS:
+                                        chunk_waveform = waveform_full[:, start_sample:end_sample]
+                                        sub_embedding = compute_waveform_embedding(
+                                            chunk_waveform,
+                                            sample_rate,
+                                            classifier,
+                                        )
+                            global_segments.append({
+                                "start": global_start,
+                                "end": global_end,
+                                "speaker": spk_label,
+                                "speaker_key": spk_label,
+                                "text": text,
+                                "segment_index": i,
+                                "embedding": sub_embedding if sub_embedding is not None else embedding,
+                            })
+                    segment_infos.append({
+                        "index": i,
+                        "start": seg_start,
+                        "end": seg_end,
+                        "speaker_key": spk_label,
+                        "speaker_name": spk_label,
+                        "duration": duration,
+                        "embedding": embedding,
+                    })
+                    segments_completed += 1
+                    if total_segments > 0:
+                        progress_fraction = min(segments_completed / total_segments, 1.0)
+                        current_info = dict(shared_jobs[job_id])
+                        current_info["segments_completed"] = segments_completed
+                        current_info["progress"] = int(progress_fraction * 100)
+                        shared_jobs[job_id] = current_info
+                global_segments.sort(key=lambda x: x["start"])
+
+                merged_plain, merged_ts, speakers_detected = finalize_diarization_segments(
+                    global_segments,
+                    segment_infos,
+                    job_dir,
+                )
+                current_info = dict(shared_jobs[job_id])
+                current_info["speakers_detected"] = speakers_detected
+                shared_jobs[job_id] = current_info
+
+            else:
+                logger.info(
+                    "Sortformer diarization produced %d segments across %d speakers.",
+                    len(sortformer_result["global_segments"]),
+                    len(sortformer_result["speakers_detected"]),
+                )
+                merged_plain = sortformer_result["merged_plain"]
+                merged_ts = sortformer_result["merged_ts"]
+                pipeline_id = sortformer_result["model_id"]
         else:
             raise ValueError("Invalid mode selected")
 
@@ -432,8 +1294,24 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
 def split_stereo(input_audio: str, output_dir: str):
     left_channel = os.path.join(output_dir, "left_speaker.wav")
     right_channel = os.path.join(output_dir, "right_speaker.wav")
-    ffmpeg.input(input_audio).output(left_channel, map="0:0", ac=1).run(overwrite_output=True, quiet=True)
-    ffmpeg.input(input_audio).output(right_channel, map="0:1", ac=1).run(overwrite_output=True, quiet=True)
+    run_ffmpeg_command([
+        "-i",
+        input_audio,
+        "-map",
+        "0:0",
+        "-ac",
+        "1",
+        left_channel,
+    ])
+    run_ffmpeg_command([
+        "-i",
+        input_audio,
+        "-map",
+        "0:1",
+        "-ac",
+        "1",
+        right_channel,
+    ])
     return left_channel, right_channel
 
 # ------------------------------------------------------

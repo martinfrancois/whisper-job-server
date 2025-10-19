@@ -42,7 +42,7 @@ At its core, Queue Whisperer is designed to manage a job queue for transcription
 
 ## Prerequisites
 
-- **Python:** Version 3.8 or higher.
+- **Python:** Version 3.10.0 up to (but not including) 3.14. Any 3.13.x release is supported, but Python 3.14+ is not.
 - **FFmpeg:** Installed and available in your system PATH.
 - **GPU (Optional):** A CUDA-capable GPU is recommended for improved performance.
 - **Hugging Face Account:** Required for using speaker detection mode.
@@ -73,15 +73,27 @@ Ensure FFmpeg is installed and accessible in your system PATH.
 
 ### Virtual Environment Setup
 
-Create and activate a Python virtual environment:
+Create and activate a virtual environment using a supported Python interpreter (3.10 ≤ version < 3.14):
 
 ```bash
-python -m venv whisper_env
+python3.13 -m venv venv
 
 # On Windows:
-whisper_env\Scripts\activate
+venv\Scripts\activate
 # On macOS/Linux:
-source whisper_env/bin/activate
+source venv/bin/activate
+```
+
+#### macOS (Homebrew)
+
+To install Python 3.13 alongside the system Python and create an isolated environment for this project:
+
+```bash
+brew install python@3.13
+PY313="$(brew --prefix python@3.13)/bin/python3.13"
+"$PY313" -m venv venv
+source venv/bin/activate
+python -m pip install -U pip wheel setuptools
 ```
 
 ### Python Dependencies
@@ -118,16 +130,14 @@ pip3 install torch torchvision torchaudio
 
 Run the command in a terminal window.
 
-### Hugging Face Authentication
+### Diarization Assets (Hugging Face)
 
-For speaker detection mode:
+Speaker diarization requires assets that live behind gated repositories on Hugging Face. The recommended (and air-gapped-friendly) setup is:
 
 1. Create an account on [Hugging Face](https://huggingface.co/).
-2. Accept the license for `pyannote/speaker-diarization` and `pyannote/segmentation`.
-3. Generate an access token from [Hugging Face Settings](https://huggingface.co/settings/tokens).
-   - Choose `Fine-grained`
-   - Under `Repositories permissions`, search for `pyannote/speaker-diarization` and `pyannote/segmentation` and give permission for `Read access to contents of selected repos`
-4. Set the token as an environment variable:
+2. Accept the licenses for `pyannote/speaker-diarization-community-1` and `pyannote/segmentation`.
+3. Generate a fine-grained access token with read permissions on `pyannote/speaker-diarization-community-1`, `pyannote/segmentation`, and `speechbrain/spkrec-ecapa-voxceleb`.
+4. Set the token on the machine that will clone the models:
 
    ```bash
    # On Windows:
@@ -136,6 +146,17 @@ For speaker detection mode:
    # On macOS/Linux:
    export HUGGING_FACE_HUB_TOKEN=your_token_here
    ```
+
+5. Install [Git LFS](https://git-lfs.com/, on macOS, run `brew install git-lfs`) and clone the pipelines directly into the project root (beside `app.py`, if prompted for a password, use a Huggingface access token from above):
+
+   ```bash
+   git lfs install
+   git clone https://hf.co/pyannote/speaker-diarization-community-1 pyannote-speaker-diarization-community-1
+   ```
+
+6. If you prepared the repository on another machine, copy the `pyannote-speaker-diarization-community-1` folder into the Queue Whisperer directory before starting the server.
+
+Queue Whisperer automatically looks for this directory next to `app.py` and loads the pipeline directly from disk. If the directory is missing, the app falls back to downloading from Hugging Face using the configured token.
 
 ## Usage
 

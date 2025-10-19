@@ -1,0 +1,7 @@
+pyannote-speaker-diarization-community-1/
+logs
+jobs
+runtime_history.json
+.idea
+*.iml
+venv

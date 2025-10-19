@@ -1,6 +1,10 @@
-fastapi==0.115.8
+fastapi==0.119.0
 python-multipart==0.0.20
-uvicorn[standard]==0.34.0
-openai-whisper==20240930
-ffmpeg-python==0.2.0
-pyannote.audio==3.3.2
+uvicorn[standard]==0.38.0
+openai-whisper==20250625
+torch==2.9.0
+torchaudio==2.9.0
+pyannote.audio==4.0.1
+pyannote.pipeline==4.0.0
+speechbrain==1.0.3
+nemo-toolkit==2.5.0
