@@ -93,6 +93,7 @@ def load_jobs_from_disk():
                 job_info["audio_duration"] = 0.0
                 job_info["estimated_time"] = 0.0
                 job_info["created_at"] = os.path.getctime(job_dir)
+            job_info.setdefault("language", "en")
             without_path = os.path.join(job_dir, "output_without_timestamps.txt")
             with_path = os.path.join(job_dir, "output_with_timestamps.txt")
             if os.path.exists(without_path) and os.path.exists(with_path):
@@ -167,11 +168,13 @@ async def websocket_endpoint(websocket: WebSocket):
 # ------------------------------------------------------
 # Main Job Processing Function
 # ------------------------------------------------------
-def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutdown_event: Event):
+def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, language: str, shutdown_event: Event):
     logger.info(f"Starting job {job_id} in {mode} mode with file {input_file_path}")
     job_info = dict(shared_jobs[job_id])
+    job_language = (language or job_info.get("language") or "en").lower()
     estimated_transcription_time = job_info.get("estimated_time", 0.0)
     job_info["status"] = "processing"
+    job_info["language"] = job_language
     shared_jobs[job_id] = job_info
     save_job_metadata(job_id, job_info)
     start_time = time.time()
@@ -203,7 +206,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
         model = whisper.load_model("large-v2")
         logger.info("Whisper model loaded in process_job")
         if mode == "one":
-            result = model.transcribe(job_input_file, language="en")
+            result = model.transcribe(job_input_file, language=job_language)
             segments = result.get("segments", [])
             merged_plain, merged_ts = [], []
             for seg in segments:
@@ -212,8 +215,8 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
                 merged_ts.append(f"[{start:.2f}s - {end:.2f}s] {text}")
         elif mode == "stereo":
             left_file, right_file = split_stereo(job_input_file, job_dir)
-            left_plain, left_ts = transcribe_audio(left_file, "Speaker 1")
-            right_plain, right_ts = transcribe_audio(right_file, "Speaker 2")
+            left_plain, left_ts = transcribe_audio(left_file, "Speaker 1", job_language)
+            right_plain, right_ts = transcribe_audio(right_file, "Speaker 2", job_language)
             merged_plain, merged_ts = merge_transcripts((left_plain, left_ts), (right_plain, right_ts))
         elif mode == "diarization":
             from pyannote.audio import Pipeline
@@ -239,7 +242,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
                 segment_file = os.path.join(job_dir, f"segment_{i}.wav")
                 duration = seg_end - seg_start
                 ffmpeg.input(job_input_file, ss=seg_start, t=duration).output(segment_file, ac=1).run(overwrite_output=True, quiet=True)
-                seg_result = model.transcribe(segment_file, language="en")
+                seg_result = model.transcribe(segment_file, language=job_language)
                 seg_segments = seg_result.get("segments", [])
                 for s in seg_segments:
                     global_start = seg_start + s["start"]
@@ -271,7 +274,8 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
             "status": "done",
             "progress": 100,
             "eta": 0,
-            "result_files": {"without": out_plain, "with": out_ts}
+            "result_files": {"without": out_plain, "with": out_ts},
+            "language": job_language
         })
         shared_jobs[job_id] = final_info
         save_job_metadata(job_id, final_info)
@@ -281,7 +285,8 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, shutd
         error_info = dict(shared_jobs[job_id])
         error_info.update({
             "status": "failed",
-            "error": str(e)
+            "error": str(e),
+            "language": job_language
         })
         shared_jobs[job_id] = error_info
         save_job_metadata(job_id, error_info)
@@ -301,9 +306,9 @@ def split_stereo(input_audio: str, output_dir: str):
 # ------------------------------------------------------
 # Helper: Transcribe a single file
 # ------------------------------------------------------
-def transcribe_audio(audio_file: str, speaker_label: str):
+def transcribe_audio(audio_file: str, speaker_label: str, language: str):
     model = whisper.load_model("large-v2")
-    result = model.transcribe(audio_file, language="en")
+    result = model.transcribe(audio_file, language=language)
     segments = result.get("segments", [])
     plain_lines, ts_lines = [], []
     for seg in segments:
@@ -372,6 +377,13 @@ def index():
           <option value="diarization">Speaker Detection Mode</option>
         </select>
       </div>
+      <div>
+        <label for="language" class="block mb-1 font-semibold">Language:</label>
+        <select name="language" id="language" class="border rounded px-3 py-2 w-full focus:outline-none focus:ring dark:bg-gray-800 dark:border-gray-700">
+          <option value="en" selected>English</option>
+          <option value="de">German</option>
+        </select>
+      </div>
       <div class="flex items-center space-x-4">
         <button type="button" id="uploadButton" onclick="submitForm()" class="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition disabled:opacity-50">
           Upload
@@ -394,6 +406,10 @@ def index():
       "one": "One Speaker Mode",
       "stereo": "Stereo Mode",
       "diarization": "Speaker Detection Mode"
+    };
+    const languageMapping = {
+      "en": "English",
+      "de": "German"
     };
     function formatHMS(sec) {
       if (!sec || sec < 0) sec = 0;
@@ -430,6 +446,7 @@ def index():
         let statusText = (job.status === "pending") ? "Queued" : job.status;
         let html = `<div class="font-semibold text-lg">${filename}</div>
                     <div class="text-sm text-gray-600 dark:text-gray-400">Mode: ${modeMapping[job.mode] || job.mode}</div>
+                    <div class="text-sm text-gray-600 dark:text-gray-400">Language: ${languageMapping[job.language] || job.language || 'English'}</div>
                     <div class="mt-2"><strong>Status:</strong> ${statusText}</div>`;
         if (job.status === "processing") {
           let pct = job.progress || 0;
@@ -572,9 +589,16 @@ def index():
 # Upload Endpoint
 # ------------------------------------------------------
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
+async def upload_file(
+    file: UploadFile = File(...),
+    mode: str = Form(...),
+    language: str = Form("en")
+):
     job_id = str(uuid.uuid4())
-    logger.info(f"New upload request: job_id={job_id}, filename={file.filename}, mode={mode}")
+    selected_language = (language or "en").lower()
+    logger.info(
+        f"New upload request: job_id={job_id}, filename={file.filename}, mode={mode}, language={selected_language}"
+    )
     job_dir = os.path.join(JOB_BASE, job_id)
     os.makedirs(job_dir, exist_ok=True)
     file_location = os.path.join(job_dir, file.filename)
@@ -588,6 +612,7 @@ async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
         "status": "pending",
         "input_file": file_location,
         "mode": mode,
+        "language": selected_language,
         "progress": 0,
         "eta": None,
         "error": None,
@@ -600,7 +625,8 @@ async def upload_file(file: UploadFile = File(...), mode: str = Form(...)):
     job_queue.put({
         "job_id": job_id,
         "file_location": file_location,
-        "mode": mode
+        "mode": mode,
+        "language": selected_language
     })
     return {"job_id": job_id, "message": "File uploaded and job queued."}
 
@@ -622,7 +648,8 @@ def restart_job(job_id: str):
     job_queue.put({
         "job_id": job_id,
         "file_location": job["input_file"],
-        "mode": job["mode"]
+        "mode": job["mode"],
+        "language": (job.get("language") or "en").lower()
     })
     return {"message": f"Job {job_id} restarted."}
 
@@ -689,7 +716,14 @@ def process_queue():
                 with processing_lock:
                     job_data = job_queue.get()
                     if job_data:
-                        process_job(jobs, job_data['job_id'], job_data['file_location'], job_data['mode'], shutdown_event)
+                        process_job(
+                            jobs,
+                            job_data['job_id'],
+                            job_data['file_location'],
+                            job_data['mode'],
+                            job_data.get('language', 'en'),
+                            shutdown_event
+                        )
             else:
                 time.sleep(1)
         except Exception as e:

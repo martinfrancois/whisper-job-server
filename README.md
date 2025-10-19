@@ -9,11 +9,11 @@ It features a built-in job queue system that supports multiple transcription mod
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
-    - [FFmpeg](#ffmpeg)
-    - [Virtual Environment Setup](#virtual-environment-setup)
-    - [Python Dependencies](#python-dependencies)
-    - [PyTorch with CUDA Support](#pytorch-with-cuda-support)
-    - [Hugging Face Authentication](#hugging-face-authentication)
+  - [FFmpeg](#ffmpeg)
+  - [Virtual Environment Setup](#virtual-environment-setup)
+  - [Python Dependencies](#python-dependencies)
+  - [PyTorch with CUDA Support](#pytorch-with-cuda-support)
+  - [Hugging Face Authentication](#hugging-face-authentication)
 - [Usage](#usage)
 - [Job Management](#job-management)
 - [Troubleshooting](#troubleshooting)
@@ -33,9 +33,9 @@ At its core, Queue Whisperer is designed to manage a job queue for transcription
 ## Features
 
 - **Multiple Transcription Modes:**
-    - **Single Speaker Mode:** For audio with one speaker.
-    - **Stereo Mode:** For dual-channel audio.
-    - **Speaker Detection:** Detects and transcribes multiple speakers using AI.
+  - **Single Speaker Mode:** For audio with one speaker.
+  - **Stereo Mode:** For dual-channel audio.
+  - **Speaker Detection:** Detects and transcribes multiple speakers using AI.
 - **Job Queue System:** Submit transcription jobs and monitor their status in real time.
 - **Download Options:** Retrieve transcriptions with or without timestamps.
 - **Developer-Friendly:** Designed for self-hosting and easy customization.
@@ -104,7 +104,7 @@ For example:
 - Language: **Python**
 - Compute Platform: **Newest CUDA version** (e.g., CUDA 12.4, ensuring it is not higher than your installed CUDA Toolkit version)
 
-Then it will show a command next to *"Run this command:"* like this:
+Then it will show a command next to _"Run this command:"_ like this:
 
 ```bash
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
@@ -126,6 +126,7 @@ For speaker detection mode:
 2. Accept the license for `pyannote/speaker-diarization`.
 3. Generate an access token from [Hugging Face Settings](https://huggingface.co/settings/tokens).
 4. Set the token as an environment variable:
+
    ```bash
    # On Windows:
    set HUGGING_FACE_HUB_TOKEN=your_token_here
