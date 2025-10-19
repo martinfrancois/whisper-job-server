@@ -38,6 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Prevent SpeechBrain from enabling deprecated TF32 APIs that trigger noisy warnings.
+os.environ.setdefault("SB_DISABLE_QUIRKS", "allow_tf32")
+
 # ------------------------------------------------------
 # Global Setup
 # ------------------------------------------------------
@@ -88,11 +91,37 @@ embedding_classifier_failed = False
 embedding_classifier_lock = threading.Lock()
 embedding_classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+USE_FP16_INFERENCE = torch.cuda.is_available()
+
+if torch.cuda.is_available():
+    # Prefer the new fp32 precision API to keep TF32 disabled unless explicitly requested.
+    try:
+        if hasattr(torch.backends, "fp32_precision"):
+            torch.backends.fp32_precision = "ieee"
+        if hasattr(torch.backends.cuda, "fp32_precision"):
+            torch.backends.cuda.fp32_precision = "ieee"
+        if hasattr(torch.backends.cudnn, "fp32_precision"):
+            torch.backends.cudnn.fp32_precision = "ieee"
+            if hasattr(torch.backends.cudnn, "conv") and hasattr(torch.backends.cudnn.conv, "fp32_precision"):
+                torch.backends.cudnn.conv.fp32_precision = "ieee"
+            if hasattr(torch.backends.cudnn, "rnn") and hasattr(torch.backends.cudnn.rnn, "fp32_precision"):
+                torch.backends.cudnn.rnn.fp32_precision = "ieee"
+    except Exception as tf_exc:
+        logger.debug("Unable to configure TF32 precision overrides: %s", tf_exc)
+
 if not hasattr(torchaudio, "list_audio_backends"):
     def _torchaudio_list_audio_backends_stub():
-        return []
+        # Newer torchaudio builds rely on SoundFile without reporting a backend.
+        return ["soundfile"]
 
     torchaudio.list_audio_backends = _torchaudio_list_audio_backends_stub
+
+if not hasattr(torchaudio, "get_audio_backend"):
+    def _torchaudio_get_audio_backend_stub():
+        available = torchaudio.list_audio_backends()
+        return available[0] if available else None
+
+    torchaudio.get_audio_backend = _torchaudio_get_audio_backend_stub
 
 # Hugging Face token (optional for gated resources)
 HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -307,7 +336,7 @@ def get_embedding_classifier():
         if embedding_classifier is not None:
             return embedding_classifier
         try:
-            from speechbrain.pretrained import EncoderClassifier
+            from speechbrain.inference import EncoderClassifier
 
             embedding_classifier = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
@@ -848,7 +877,11 @@ def process_sortformer_diarization(shared_jobs, job_id: str, job_dir: str, job_i
                 waveform_full = None
                 sample_rate = None
         try:
-            seg_result = whisper_model.transcribe(segment_file, language=job_language)
+            seg_result = whisper_model.transcribe(
+                segment_file,
+                language=job_language,
+                fp16=USE_FP16_INFERENCE,
+            )
         except Exception as exc:
             logger.warning("Whisper failed on segment %d (%s-%s): %s", idx, start, end, exc)
             text = ""
@@ -1061,7 +1094,11 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
         model = whisper.load_model("large-v2")
         logger.info("Whisper model loaded in process_job")
         if mode == "one":
-            result = model.transcribe(job_input_file, language=job_language)
+            result = model.transcribe(
+                job_input_file,
+                language=job_language,
+                fp16=USE_FP16_INFERENCE,
+            )
             segments = result.get("segments", [])
             merged_plain, merged_ts = [], []
             for seg in segments:
@@ -1165,7 +1202,11 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
                             logger.debug("Embedding computation failed for %s: %s", segment_file, emb_exc)
                             waveform_full = None
                             sample_rate = None
-                    seg_result = model.transcribe(segment_file, language=job_language)
+                    seg_result = model.transcribe(
+                        segment_file,
+                        language=job_language,
+                        fp16=USE_FP16_INFERENCE,
+                    )
                     seg_segments = seg_result.get("segments", [])
                     if not seg_segments and seg_result.get("text"):
                         seg_segments = [{"start": 0.0, "end": duration, "text": seg_result.get("text", "")}]
@@ -1319,7 +1360,11 @@ def split_stereo(input_audio: str, output_dir: str):
 # ------------------------------------------------------
 def transcribe_audio(audio_file: str, speaker_label: str, language: str):
     model = whisper.load_model("large-v2")
-    result = model.transcribe(audio_file, language=language)
+    result = model.transcribe(
+        audio_file,
+        language=language,
+        fp16=USE_FP16_INFERENCE,
+    )
     segments = result.get("segments", [])
     plain_lines, ts_lines = [], []
     for seg in segments:
