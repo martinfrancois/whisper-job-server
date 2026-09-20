@@ -1,6 +1,4 @@
-fastapi==0.119.0
-python-multipart==0.0.20
-uvicorn[standard]==0.38.0
+-r requirements-web.txt
 openai-whisper==20250625
 torch==2.9.0
 torchaudio==2.9.0

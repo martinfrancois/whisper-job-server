@@ -1,20 +1,20 @@
+from __future__ import annotations
+
 import os
 from pathlib import Path
 import logging
+import re
+import secrets
 from datetime import datetime
 import uuid
 import shutil
 import subprocess
-import whisper
 import time
 import asyncio
 import threading
 import multiprocessing
-import torch
-import torchaudio
-import torch.nn.functional as F
 from multiprocessing import Event
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, UploadFile, File, Form, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -46,6 +46,26 @@ os.environ.setdefault("SB_DISABLE_QUIRKS", "allow_tf32")
 # ------------------------------------------------------
 JOB_BASE = "jobs"
 os.makedirs(JOB_BASE, exist_ok=True)
+
+# Network and access settings. The server has no user management, so it
+# listens on the loopback interface unless told otherwise.
+HOST = os.getenv("WHISPER_JOB_SERVER_HOST", "127.0.0.1")
+PORT = int(os.getenv("WHISPER_JOB_SERVER_PORT", "8000"))
+# When set, every request that creates, restarts or removes a job must carry
+# the header "Authorization: Bearer <token>".
+API_TOKEN = os.getenv("WHISPER_JOB_SERVER_TOKEN") or None
+# Comma-separated browser origins allowed to call the API from another site.
+# Empty means no CORS headers, which is what the built-in web page needs.
+CORS_ORIGINS = [o.strip() for o in os.getenv("WHISPER_JOB_SERVER_CORS_ORIGINS", "").split(",") if o.strip()]
+MAX_UPLOAD_BYTES = int(os.getenv("WHISPER_JOB_SERVER_MAX_UPLOAD_MB", "2048")) * 1024 * 1024
+# Uploads are stored under a server-generated name, so the client-supplied
+# filename only contributes its extension, and only from this list.
+ALLOWED_UPLOAD_EXTENSIONS = frozenset({
+    ".3gp", ".aac", ".aif", ".aiff", ".amr", ".avi", ".flac", ".m4a", ".m4v",
+    ".mkv", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".oga", ".ogg", ".opus",
+    ".wav", ".webm", ".wma", ".wmv",
+})
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 manager = None
 jobs = None
@@ -85,43 +105,73 @@ SORTFORMER_MODEL_ID = "nvidia/diar_sortformer_4spk-v1"
 SORTFORMER_ENABLED = False
 sortformer_model = None
 sortformer_model_lock = threading.Lock()
-sortformer_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+sortformer_device = None
 embedding_classifier = None
 embedding_classifier_failed = False
 embedding_classifier_lock = threading.Lock()
-embedding_classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+embedding_classifier_device = None
 
-USE_FP16_INFERENCE = torch.cuda.is_available()
+USE_FP16_INFERENCE = False
 
-if torch.cuda.is_available():
-    # Prefer the new fp32 precision API to keep TF32 disabled unless explicitly requested.
-    try:
-        if hasattr(torch.backends, "fp32_precision"):
-            torch.backends.fp32_precision = "ieee"
-        if hasattr(torch.backends.cuda, "fp32_precision"):
-            torch.backends.cuda.fp32_precision = "ieee"
-        if hasattr(torch.backends.cudnn, "fp32_precision"):
-            torch.backends.cudnn.fp32_precision = "ieee"
-            if hasattr(torch.backends.cudnn, "conv") and hasattr(torch.backends.cudnn.conv, "fp32_precision"):
-                torch.backends.cudnn.conv.fp32_precision = "ieee"
-            if hasattr(torch.backends.cudnn, "rnn") and hasattr(torch.backends.cudnn.rnn, "fp32_precision"):
-                torch.backends.cudnn.rnn.fp32_precision = "ieee"
-    except Exception as tf_exc:
-        logger.debug("Unable to configure TF32 precision overrides: %s", tf_exc)
+# torch, torchaudio and whisper are imported by load_ml_runtime() from the job
+# worker, not at module import, so that starting the server, running the tests
+# and serving the API do not load the ML stack or download models.
+torch = None
+torchaudio = None
+F = None
+whisper = None
+ml_runtime_lock = threading.Lock()
 
-if not hasattr(torchaudio, "list_audio_backends"):
-    def _torchaudio_list_audio_backends_stub():
-        # Newer torchaudio builds rely on SoundFile without reporting a backend.
-        return ["soundfile"]
 
-    torchaudio.list_audio_backends = _torchaudio_list_audio_backends_stub
+def load_ml_runtime() -> None:
+    global torch, torchaudio, F, whisper
+    global sortformer_device, embedding_classifier_device, USE_FP16_INFERENCE
+    with ml_runtime_lock:
+        if torch is not None:
+            return
+        import torch as torch_module
+        import torchaudio as torchaudio_module
+        import torch.nn.functional as functional_module
+        import whisper as whisper_module
 
-if not hasattr(torchaudio, "get_audio_backend"):
-    def _torchaudio_get_audio_backend_stub():
-        available = torchaudio.list_audio_backends()
-        return available[0] if available else None
+        torch = torch_module
+        torchaudio = torchaudio_module
+        F = functional_module
+        whisper = whisper_module
 
-    torchaudio.get_audio_backend = _torchaudio_get_audio_backend_stub
+        sortformer_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        embedding_classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        USE_FP16_INFERENCE = torch.cuda.is_available()
+
+        if torch.cuda.is_available():
+            # Prefer the new fp32 precision API to keep TF32 disabled unless explicitly requested.
+            try:
+                if hasattr(torch.backends, "fp32_precision"):
+                    torch.backends.fp32_precision = "ieee"
+                if hasattr(torch.backends.cuda, "fp32_precision"):
+                    torch.backends.cuda.fp32_precision = "ieee"
+                if hasattr(torch.backends.cudnn, "fp32_precision"):
+                    torch.backends.cudnn.fp32_precision = "ieee"
+                    if hasattr(torch.backends.cudnn, "conv") and hasattr(torch.backends.cudnn.conv, "fp32_precision"):
+                        torch.backends.cudnn.conv.fp32_precision = "ieee"
+                    if hasattr(torch.backends.cudnn, "rnn") and hasattr(torch.backends.cudnn.rnn, "fp32_precision"):
+                        torch.backends.cudnn.rnn.fp32_precision = "ieee"
+            except Exception as tf_exc:
+                logger.debug("Unable to configure TF32 precision overrides: %s", tf_exc)
+
+        if not hasattr(torchaudio, "list_audio_backends"):
+            def _torchaudio_list_audio_backends_stub():
+                # Newer torchaudio builds rely on SoundFile without reporting a backend.
+                return ["soundfile"]
+
+            torchaudio.list_audio_backends = _torchaudio_list_audio_backends_stub
+
+        if not hasattr(torchaudio, "get_audio_backend"):
+            def _torchaudio_get_audio_backend_stub():
+                available = torchaudio.list_audio_backends()
+                return available[0] if available else None
+
+            torchaudio.get_audio_backend = _torchaudio_get_audio_backend_stub
 
 # Hugging Face token (optional for gated resources)
 HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -995,13 +1045,50 @@ async def lifespan(app: FastAPI):
 # Create FastAPI App and Add Middleware
 # ------------------------------------------------------
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+# ------------------------------------------------------
+# Access control for endpoints that change jobs
+# ------------------------------------------------------
+def require_token(authorization: str | None = Header(default=None)) -> None:
+    if API_TOKEN is None:
+        return
+    expected = f"Bearer {API_TOKEN}"
+    if authorization is None or not secrets.compare_digest(authorization.encode(), expected.encode()):
+        raise HTTPException(
+            status_code=401,
+            detail="A bearer token is required for this request.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def safe_display_name(filename: str | None) -> str:
+    """Reduce a client-supplied filename to a basename made of plain characters."""
+    base = (filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]", "_", base).strip(" .")
+    return cleaned[:100] or "upload"
+
+
+def upload_extension(filename: str | None) -> str:
+    """Validate the client-supplied filename and return its extension."""
+    name = filename or ""
+    if not name or "\\" in name or name != os.path.basename(name) or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Filename must be a plain name without a path.")
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="File type not allowed. Accepted extensions: " + ", ".join(sorted(ALLOWED_UPLOAD_EXTENSIONS)),
+        )
+    return ext
 
 # ------------------------------------------------------
 # WebSocket Endpoint
@@ -1069,6 +1156,7 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
     job_dir = os.path.join(JOB_BASE, job_id)
     job_input_file = os.path.join(job_dir, "input.wav")
     try:
+        load_ml_runtime()
         try:
             # Convert any incoming media to a mono 16 kHz WAV so downstream
             # pipelines (e.g., pyannote) always receive a supported format.
@@ -1497,7 +1585,7 @@ def index():
         let card = document.createElement("div");
         card.className = "p-4 border border-gray-300 dark:border-gray-700 rounded shadow-sm";
         card.id = "job-" + job.id;
-        let filename = job.input_file.split(/(\\|\/)/g).pop();
+        let filename = job.original_filename || job.input_file.split(/(\\|\/)/g).pop();
         if (filename.startsWith('jobs/')) filename = filename.split('/').pop();
         let statusText = (job.status === "pending") ? "Queued" : job.status;
         let html = `<div class="font-semibold text-lg">${filename}</div>
@@ -1545,10 +1633,30 @@ def index():
         jobListDiv.appendChild(card);
       });
     }
+    // Optional bearer token, see the Security section of the README. The
+    // browser asks for it the first time the server answers 401 and keeps it
+    // for the tab's session.
+    function authHeaders() {
+      const token = sessionStorage.getItem("apiToken");
+      return token ? { "Authorization": "Bearer " + token } : {};
+    }
+    function askForToken() {
+      const token = prompt("This server requires an API token. Enter it to continue:");
+      if (!token) return false;
+      sessionStorage.setItem("apiToken", token.trim());
+      return true;
+    }
+    async function fetchWithToken(url) {
+      let response = await fetch(url, { headers: authHeaders() });
+      if (response.status === 401 && askForToken()) {
+        response = await fetch(url, { headers: authHeaders() });
+      }
+      return response;
+    }
     async function removeJob(jobId) {
       if (!confirm('Are you sure you want to remove this job?')) return;
       try {
-        const response = await fetch('/remove/' + jobId);
+        const response = await fetchWithToken('/remove/' + jobId);
         if (!response.ok) {
           const error = await response.text();
           console.error('Failed to remove job:', error);
@@ -1562,7 +1670,7 @@ def index():
     async function restartJob(jobId) {
       if (!confirm('Are you sure you want to restart this failed job?')) return;
       try {
-        const response = await fetch('/restart/' + jobId);
+        const response = await fetchWithToken('/restart/' + jobId);
         if (!response.ok) {
           const error = await response.text();
           console.error('Failed to restart job:', error);
@@ -1584,6 +1692,8 @@ def index():
       progressDiv.classList.remove("hidden");
       const xhr = new XMLHttpRequest();
       xhr.open("POST", "/upload", true);
+      const token = sessionStorage.getItem("apiToken");
+      if (token) xhr.setRequestHeader("Authorization", "Bearer " + token);
       xhr.upload.onprogress = function(e) {
         if (e.lengthComputable) {
           const pct = (e.loaded / e.total) * 100;
@@ -1595,6 +1705,9 @@ def index():
         if (xhr.status === 200) {
           form.reset();
           console.log("Upload successful:", xhr.response);
+        } else if (xhr.status === 401 && askForToken()) {
+          submitForm();
+          return;
         } else {
           console.error("Upload failed:", xhr.responseText);
           alert("Upload failed: " + xhr.responseText);
@@ -1644,7 +1757,7 @@ def index():
 # ------------------------------------------------------
 # Upload Endpoint
 # ------------------------------------------------------
-@app.post("/upload")
+@app.post("/upload", dependencies=[Depends(require_token)])
 async def upload_file(
     file: UploadFile = File(...),
     mode: str = Form(...),
@@ -1652,20 +1765,38 @@ async def upload_file(
 ):
     job_id = str(uuid.uuid4())
     selected_language = (language or "en").lower()
+    display_name = safe_display_name(file.filename)
+    extension = upload_extension(file.filename)
     logger.info(
-        f"New upload request: job_id={job_id}, filename={file.filename}, mode={mode}, language={selected_language}"
+        f"New upload request: job_id={job_id}, filename={display_name}, mode={mode}, language={selected_language}"
     )
-    job_dir = os.path.join(JOB_BASE, job_id)
+    job_base = Path(JOB_BASE).resolve()
+    job_dir = job_base / job_id
+    file_path = (job_dir / f"{uuid.uuid4()}{extension}").resolve()
+    if job_base not in file_path.parents:
+        raise HTTPException(status_code=400, detail="Invalid upload path.")
     os.makedirs(job_dir, exist_ok=True)
-    file_location = os.path.join(job_dir, file.filename)
-    with open(file_location, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    file_location = os.path.join(JOB_BASE, job_id, file_path.name)
+    received = 0
+    try:
+        with open(file_location, "wb") as f:
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                received += len(chunk)
+                if received > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload exceeds the limit of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
     duration_sec = get_audio_duration(file_location)
     estimated_time = estimate_runtime_seconds(duration_sec, mode, selected_language)
     job_info = {
         "status": "pending",
         "input_file": file_location,
+        "original_filename": display_name,
         "mode": mode,
         "language": selected_language,
         "progress": 0,
@@ -1688,7 +1819,7 @@ async def upload_file(
 # ------------------------------------------------------
 # Restart Endpoint
 # ------------------------------------------------------
-@app.get("/restart/{job_id}")
+@app.get("/restart/{job_id}", dependencies=[Depends(require_token)])
 def restart_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1717,7 +1848,7 @@ def restart_job(job_id: str):
 # ------------------------------------------------------
 # Remove Endpoint
 # ------------------------------------------------------
-@app.get("/remove/{job_id}")
+@app.get("/remove/{job_id}", dependencies=[Depends(require_token)])
 def remove_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1754,7 +1885,7 @@ def download_file(job_id: str, file_type: str):
     file_path = job["result_files"][file_type]
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
-    base_name = os.path.splitext(os.path.basename(job["input_file"]))[0]
+    base_name = os.path.splitext(job.get("original_filename") or os.path.basename(job["input_file"]))[0]
     dl_name = f"{base_name}_transcription.txt" if file_type == "without" else f"{base_name}_transcription_timestamps.txt"
     return FileResponse(file_path, media_type="text/plain", filename=dl_name)
 
@@ -1807,7 +1938,8 @@ def process_startup():
 if __name__ == "__main__":
     logger.info("Starting application...")
     process_startup()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info(f"Listening on http://{HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT)
     logger.info("Shutting down manager...")
     if manager:
         manager.shutdown()
