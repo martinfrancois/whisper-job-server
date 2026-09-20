@@ -46,8 +46,8 @@ Three modes:
 - FFmpeg and FFprobe on the `PATH`, or their paths in `FFMPEG_BIN` and
   `FFPROBE_BIN`.
 - About 3 GB of disk for the Whisper `large-v2` model, which downloads on the
-  first job, and enough RAM to hold it. A CUDA GPU makes transcription much
-  faster but is optional.
+  first job, and enough RAM to hold it. A CUDA GPU is optional; the example
+  below was run with the CPU build of PyTorch.
 - A Hugging Face account for speaker detection mode only.
 
 ## Installation
@@ -81,9 +81,8 @@ interpreter; create the virtual environment with
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pins every package. On Linux this installs the CUDA build
-of PyTorch from PyPI, which is large. For a CPU-only machine install the CPU
-build first, then the rest:
+`requirements.txt` pins every package. On a machine without a GPU, install
+the CPU build of PyTorch first so that pip keeps it, then the rest:
 
 ```bash
 pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cpu
@@ -292,8 +291,8 @@ and is skipped otherwise. CI runs the same command on Ubuntu with Python 3.12.
   code.
 - The bearer token protects the endpoints that change jobs, not the ones that
   read them.
-- Speaker detection is much slower than the other modes and needs the gated
-  Hugging Face models.
+- Speaker detection needs the gated Hugging Face models, and the server's own
+  default estimate puts it at three times the runtime of single speaker mode.
 
 ## License
 
