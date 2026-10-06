@@ -1,0 +1,91 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "description": "No CI runs on this repository's pull requests, so no rule here merges automatically: with ignoreTests false Renovate would wait for checks that never report. Add the non-major automerge rule once a workflow checks pull requests.",
+  "reviewers": [
+    "martinfrancois"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "automergeType": "pr",
+  "platformAutomerge": false,
+  "ignoreTests": false,
+  "internalChecksFilter": "strict",
+  "minimumReleaseAge": "7 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "statusCheckWhen": {
+    "minimumReleaseAge": "never"
+  },
+  "pinDigests": true,
+  "rangeStrategy": "pin",
+  "dependencyDashboardApproval": false,
+  "prConcurrentLimit": 0,
+  "branchConcurrentLimit": 0,
+  "separateMajorMinor": true,
+  "separateMultipleMajor": false,
+  "separateMinorPatch": false,
+  "rebaseWhen": "conflicted",
+  "schedule": [
+    "* 0-4 * * 5"
+  ],
+  "updateNotScheduled": false,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": [
+      "security"
+    ],
+    "minimumReleaseAge": null,
+    "schedule": [],
+    "updateNotScheduled": true,
+    "groupName": null,
+    "groupSlug": null
+  },
+  "packageRules": [
+    {
+      "description": "Major updates require human review.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false,
+      "addLabels": [
+        "major update"
+      ]
+    },
+    {
+      "description": "Private repository: combine eligible automatic updates after package-specific rules to conserve Actions minutes. Keep existing review requirements unchanged.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "matchJsonata": [
+        "automerge = true"
+      ],
+      "groupName": "Routine dependency updates",
+      "groupSlug": "routine-dependencies"
+    },
+    {
+      "description": "Private repository: bundle review-required updates without enabling automerge. Keep majors separate from reviewed non-major updates so incompatible major upgrades do not block other reviewed fixes.",
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "matchJsonata": [
+        "$not(automerge = true)"
+      ],
+      "groupName": "Reviewed dependency updates",
+      "groupSlug": "reviewed-dependencies",
+      "automerge": false
+    }
+  ]
+}
