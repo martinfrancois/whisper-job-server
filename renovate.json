@@ -30,7 +30,7 @@
   "separateMinorPatch": false,
   "rebaseWhen": "conflicted",
   "schedule": [
-    "* 0-4 * * 5"
+    "* * * * 5"
   ],
   "updateNotScheduled": false,
   "vulnerabilityAlerts": {
