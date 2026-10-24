@@ -57,7 +57,8 @@ API_TOKEN = os.getenv("WHISPER_JOB_SERVER_TOKEN") or None
 # Comma-separated browser origins allowed to call the API from another site.
 # Empty means no CORS headers, which is what the built-in web page needs.
 CORS_ORIGINS = [o.strip() for o in os.getenv("WHISPER_JOB_SERVER_CORS_ORIGINS", "").split(",") if o.strip()]
-MAX_UPLOAD_BYTES = int(os.getenv("WHISPER_JOB_SERVER_MAX_UPLOAD_MB", "2048")) * 1024 * 1024
+BYTES_PER_MB = 1024 * 1024
+MAX_UPLOAD_MB = int(os.getenv("WHISPER_JOB_SERVER_MAX_UPLOAD_MB", "2048"))
 # Uploads are stored under a server-generated name, so the client-supplied
 # filename only contributes its extension, and only from this list.
 ALLOWED_UPLOAD_EXTENSIONS = frozenset({
@@ -65,7 +66,7 @@ ALLOWED_UPLOAD_EXTENSIONS = frozenset({
     ".mkv", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".oga", ".ogg", ".opus",
     ".wav", ".webm", ".wma", ".wmv",
 })
-UPLOAD_CHUNK_BYTES = 1024 * 1024
+UPLOAD_CHUNK_BYTES = BYTES_PER_MB
 
 manager = None
 jobs = None
@@ -1770,25 +1771,26 @@ async def upload_file(
     logger.info(
         f"New upload request: job_id={job_id}, filename={display_name}, mode={mode}, language={selected_language}"
     )
-    job_base = Path(JOB_BASE).resolve()
-    job_dir = job_base / job_id
-    file_path = (job_dir / f"{uuid.uuid4()}{extension}").resolve()
-    if job_base not in file_path.parents:
+    job_dir = os.path.join(JOB_BASE, job_id)
+    file_location = os.path.join(job_dir, f"{uuid.uuid4()}{extension}")
+    # Both path parts are generated here; the check keeps it that way if that ever changes.
+    if Path(JOB_BASE).resolve() not in Path(file_location).resolve().parents:
         raise HTTPException(status_code=400, detail="Invalid upload path.")
     os.makedirs(job_dir, exist_ok=True)
-    file_location = os.path.join(JOB_BASE, job_id, file_path.name)
+    max_upload_bytes = MAX_UPLOAD_MB * BYTES_PER_MB
     received = 0
     try:
         with open(file_location, "wb") as f:
             while chunk := await file.read(UPLOAD_CHUNK_BYTES):
                 received += len(chunk)
-                if received > MAX_UPLOAD_BYTES:
+                if received > max_upload_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Upload exceeds the limit of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                        detail=f"Upload exceeds the limit of {MAX_UPLOAD_MB} MB.",
                     )
                 f.write(chunk)
-    except HTTPException:
+    # BaseException so that a cancelled request also leaves no half-written job folder.
+    except BaseException:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
     duration_sec = get_audio_duration(file_location)

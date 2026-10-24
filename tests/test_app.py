@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import threading
@@ -58,9 +59,36 @@ def test_extension_outside_allowlist_rejected(app, client, filename):
 
 
 def test_oversize_upload_rejected(app, client, monkeypatch):
-    monkeypatch.setattr(app, "MAX_UPLOAD_BYTES", 1024)
-    response = upload(client, data=b"\0" * 4096)
+    monkeypatch.setattr(app, "MAX_UPLOAD_MB", 1)
+    response = upload(client, data=b"\0" * (app.BYTES_PER_MB + 1))
     assert response.status_code == 413
+    assert "1 MB" in response.json()["detail"]
+    assert app.jobs == {}
+    assert os.listdir(app.JOB_BASE) == []
+    assert app.job_queue.empty()
+
+
+def test_upload_at_limit_accepted(app, client, monkeypatch):
+    monkeypatch.setattr(app, "MAX_UPLOAD_MB", 1)
+    response = upload(client, data=b"\0" * app.BYTES_PER_MB)
+    assert response.status_code == 200, response.text
+
+
+def test_failed_write_leaves_no_job_folder(app, client, monkeypatch):
+    class FullDisk:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, chunk):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    # app.py looks up open() in its module globals before the builtins.
+    monkeypatch.setattr(app, "open", lambda *args, **kwargs: FullDisk(), raising=False)
+    with pytest.raises(OSError):
+        upload(client)
     assert app.jobs == {}
     assert os.listdir(app.JOB_BASE) == []
     assert app.job_queue.empty()
