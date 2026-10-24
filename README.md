@@ -1,69 +1,88 @@
 # Queue Whisperer
 
-A self-hosted web server that queues audio and video files and transcribes them with OpenAI's Whisper.
+Queue Whisperer is a self-hosted web application that manages audio transcription jobs using OpenAI's Whisper.
+It features a built-in job queue system that supports multiple transcription modes, allowing you to submit, process, and monitor transcription tasks in real time.
 
-## Table of contents
+## Table of Contents
 
-- [What it does](#what-it-does)
-- [Requirements](#requirements)
+- [Overview](#overview)
+- [Features](#features)
+- [Prerequisites](#prerequisites)
 - [Installation](#installation)
   - [FFmpeg](#ffmpeg)
-  - [Virtual environment](#virtual-environment)
-  - [Python dependencies](#python-dependencies)
-  - [PyTorch with CUDA support](#pytorch-with-cuda-support)
-  - [Diarization assets from Hugging Face](#diarization-assets-from-hugging-face)
+  - [Virtual Environment Setup](#virtual-environment-setup)
+  - [Python Dependencies](#python-dependencies)
+  - [PyTorch with CUDA Support](#pytorch-with-cuda-support)
+  - [Diarization Assets (Hugging Face)](#diarization-assets-hugging-face)
 - [Usage](#usage)
+- [HTTP API](#http-api)
 - [Configuration](#configuration)
 - [Security](#security)
 - [Example](#example)
-- [Job management](#job-management)
+- [Tests](#tests)
+- [Job Management](#job-management)
 - [Troubleshooting](#troubleshooting)
-- [Limitations](#limitations)
+- [Notes](#notes)
 - [License](#license)
 
-## What it does
+## Overview
 
-`app.py` is a FastAPI application with a web page at `/`. You upload a file,
-pick a mode and a language, and the server converts the file to 16 kHz mono
-WAV with FFmpeg, runs Whisper `large-v2` on it and stores two transcripts, one
-plain and one with timestamps. Jobs run one after another. The page shows
-progress over a WebSocket and offers both transcripts for download.
+Queue Whisperer is built with FastAPI and leverages OpenAI's Whisper model to transcribe audio files.
+It supports:
 
-Three modes:
+- **Single Speaker Mode:** For audio with one speaker.
+- **Stereo Mode:** For dual-channel audio.
+- **Speaker Detection:** AI-based detection and transcription of multiple speakers.
 
-- Single speaker: one Whisper pass over the whole file.
-- Stereo: the two channels are transcribed separately as Speaker 1 and
-  Speaker 2 and merged by timestamp. Use it for calls recorded with one
-  speaker per channel.
-- Speaker detection: `pyannote` diarization splits the audio by speaker, each
-  segment is transcribed, and speaker labels are cleaned up with speaker
-  embeddings from SpeechBrain.
+At its core, Queue Whisperer is designed to manage a job queue for transcription tasks, enabling you to submit jobs, track their progress, and retrieve results once processing is complete.
 
-## Requirements
+## Features
 
-- Python 3.10 or newer. The pinned packages need at least 3.10; the tests run
-  on 3.12 and 3.13.
-- FFmpeg and FFprobe on the `PATH`, or their paths in `FFMPEG_BIN` and
-  `FFPROBE_BIN`.
-- About 3 GB of disk for the Whisper `large-v2` model, which downloads on the
-  first job, and enough RAM to hold it. A CUDA GPU is optional; the example
-  below was run with the CPU build of PyTorch.
-- A Hugging Face account for speaker detection mode only.
+- **Multiple Transcription Modes:**
+  - **Single Speaker Mode:** For audio with one speaker.
+  - **Stereo Mode:** For dual-channel audio.
+  - **Speaker Detection:** Detects and transcribes multiple speakers using AI.
+- **Job Queue System:** Submit transcription jobs and monitor their status in real time.
+- **Download Options:** Retrieve transcriptions with or without timestamps.
+- **Developer-Friendly:** Designed for self-hosting and easy customization.
+
+## Prerequisites
+
+- **Python:** Version 3.10.0 up to (but not including) 3.14. Any 3.13.x release is supported, but Python 3.14+ is not. CI runs the tests on Python 3.12 only.
+- **FFmpeg:** Installed and available in your system PATH (both `ffmpeg` and `ffprobe`).
+- **GPU (Optional):** A CUDA-capable GPU is recommended for improved performance.
+- **Hugging Face Account:** Required for using speaker detection mode.
 
 ## Installation
 
 ### FFmpeg
 
-- Windows: download from [ffmpeg.org](https://ffmpeg.org/download.html) or
-  `choco install ffmpeg`
-- macOS: `brew install ffmpeg`
-- Debian or Ubuntu: `sudo apt update && sudo apt install ffmpeg`
-- Fedora: `sudo dnf install ffmpeg`
+Ensure FFmpeg is installed and accessible in your system PATH.
 
-### Virtual environment
+- **Windows:**  
+  Download from the [FFmpeg website](https://ffmpeg.org/download.html) or install via Chocolatey:
+  ```bash
+  choco install ffmpeg
+  ```
+- **macOS:**
+  ```bash
+  brew install ffmpeg
+  ```
+- **Linux (Debian/Ubuntu):**
+  ```bash
+  sudo apt update && sudo apt install ffmpeg
+  ```
+- **Linux (Fedora/CentOS):**
+  ```bash
+  sudo dnf install ffmpeg
+  ```
+
+### Virtual Environment Setup
+
+Create and activate a virtual environment using a supported Python interpreter (3.10 ≤ version < 3.14):
 
 ```bash
-python3 -m venv venv
+python3.13 -m venv venv
 
 # On Windows:
 venv\Scripts\activate
@@ -71,46 +90,59 @@ venv\Scripts\activate
 source venv/bin/activate
 ```
 
-On macOS with Homebrew, `brew install python@3.13` gives you a recent
-interpreter; create the virtual environment with
-`"$(brew --prefix python@3.13)/bin/python3.13" -m venv venv`.
+#### macOS (Homebrew)
 
-### Python dependencies
+To install Python 3.13 alongside the system Python and create an isolated environment for this project:
+
+```bash
+brew install python@3.13
+PY313="$(brew --prefix python@3.13)/bin/python3.13"
+"$PY313" -m venv venv
+source venv/bin/activate
+python -m pip install -U pip wheel setuptools
+```
+
+### Python Dependencies
+
+Install the required packages:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pins every package. On a machine without a GPU, install
-the CPU build of PyTorch first so that pip keeps it, then the rest:
+### PyTorch with CUDA Support
 
-```bash
-pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-```
+If you have a CUDA-capable GPU, install PyTorch with CUDA support. Visit the [PyTorch Get Started](https://pytorch.org/get-started/locally/) page and choose the options appropriate for your system.
 
-### PyTorch with CUDA support
+For example:
 
-If you have a CUDA-capable GPU, pick the matching build on the
-[PyTorch Get Started](https://pytorch.org/get-started/locally/) page and run
-the command it shows, for example:
+- PyTorch Build: **Stable**
+- Your OS: **Windows**
+- Package: **Pip**
+- Language: **Python**
+- Compute Platform: **Newest CUDA version** (e.g., CUDA 12.4, ensuring it is not higher than your installed CUDA Toolkit version)
+
+Then it will show a command next to _"Run this command:"_ like this:
 
 ```bash
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 ```
 
-Keep the CUDA version at or below the CUDA toolkit installed on the machine.
+If a GPU is not available, install the CPU build of the `torch` and `torchaudio` versions pinned in `requirements.txt`. With the current pins, the command is:
 
-### Diarization assets from Hugging Face
+```bash
+pip3 install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+```
 
-Speaker detection mode needs gated models from Hugging Face.
+Run the command in a terminal window.
+
+### Diarization Assets (Hugging Face)
+
+Speaker diarization requires assets that live behind gated repositories on Hugging Face. The recommended (and air-gapped-friendly) setup is:
 
 1. Create an account on [Hugging Face](https://huggingface.co/).
-2. Accept the licenses of `pyannote/speaker-diarization-community-1` and
-   `pyannote/segmentation`.
-3. Generate a fine-grained access token with read permission on
-   `pyannote/speaker-diarization-community-1`, `pyannote/segmentation` and
-   `speechbrain/spkrec-ecapa-voxceleb`.
+2. Accept the licenses for `pyannote/speaker-diarization-community-1` and `pyannote/segmentation`.
+3. Generate a fine-grained access token with read permissions on `pyannote/speaker-diarization-community-1`, `pyannote/segmentation`, and `speechbrain/spkrec-ecapa-voxceleb`.
 4. Set the token on the machine that will clone the models:
 
    ```bash
@@ -121,33 +153,39 @@ Speaker detection mode needs gated models from Hugging Face.
    export HUGGING_FACE_HUB_TOKEN=your_token_here
    ```
 
-5. Install [Git LFS](https://git-lfs.com/) and clone the pipeline next to
-   `app.py`. If git asks for a password, use the access token.
+5. Install [Git LFS](https://git-lfs.com/) (on macOS, run `brew install git-lfs`) and clone the pipelines directly into the project root, beside `app.py`. If prompted for a password, use the Hugging Face access token from above:
 
    ```bash
    git lfs install
    git clone https://hf.co/pyannote/speaker-diarization-community-1 pyannote-speaker-diarization-community-1
    ```
 
-6. If you prepared the clone on another machine, copy the
-   `pyannote-speaker-diarization-community-1` folder next to `app.py` before
-   starting the server.
+6. If you prepared the repository on another machine, copy the `pyannote-speaker-diarization-community-1` folder into the Queue Whisperer directory before starting the server.
 
-The server loads the pipeline from that folder when it exists. Otherwise it
-downloads the pipeline from Hugging Face with `HUGGING_FACE_HUB_TOKEN`.
+Queue Whisperer automatically looks for this directory next to `app.py` and loads the pipeline directly from disk. If the directory is missing, the app falls back to downloading from Hugging Face using the configured token.
 
 ## Usage
 
-```bash
-python app.py
-```
+1. **Start the Server:**
+   ```bash
+   python app.py
+   ```
+2. **Access the Application:**  
+   Open your browser and navigate to:
+   ```
+   http://localhost:8000
+   ```
+   By default the server only accepts connections from the same machine. See [Configuration](#configuration) and [Security](#security) before you change that.
+3. **Submit a Job:**  
+   Use the web interface to upload an audio or video file, select the transcription mode, and submit the job.
+4. **Monitor Progress:**  
+   The job queue system provides real-time status updates via WebSocket.
+5. **Download Results:**  
+   Once a job is complete, download the transcription with or without timestamps.
 
-The server listens on `http://127.0.0.1:8000`. Open that address, upload an
-audio or video file, choose the mode and the language, and watch the job in
-the list below the form. When it is done, download the transcript with or
-without timestamps.
+## HTTP API
 
-The same actions are available over HTTP:
+Everything the web interface does is also available over HTTP:
 
 | Method and path | Purpose |
 |---|---|
@@ -159,11 +197,7 @@ The same actions are available over HTTP:
 | `GET /remove/{job_id}` | Delete a job and its files. |
 | `WS /ws` | Sends the job table as JSON once per second. |
 
-Uploads must be a plain filename with one of these extensions: 3gp, aac, aif,
-aiff, amr, avi, flac, m4a, m4v, mkv, mov, mp3, mp4, mpeg, mpg, oga, ogg, opus,
-wav, webm, wma, wmv. The server stores the file under a generated name inside
-`jobs/<job id>/` and keeps the original name for display and for the download
-filename.
+The uploaded filename must be a plain name without a path and end in one of these extensions: 3gp, aac, aif, aiff, amr, avi, flac, m4a, m4v, mkv, mov, mp3, mp4, mpeg, mpg, oga, ogg, opus, wav, webm, wma, wmv. The server stores the file under a generated name inside `jobs/<job id>/` and keeps the original name for display and for the download filename.
 
 ## Configuration
 
@@ -181,34 +215,17 @@ All settings are environment variables.
 
 ## Security
 
-The server has no user management. Anyone who can reach the port can upload
-files, list jobs and download transcripts. By default it therefore listens on
-the loopback interface only, so only programs on the same machine can reach
-it.
+Queue Whisperer has no user management. Anyone who can reach the port can upload files, list jobs and download transcripts. By default it therefore listens on the loopback interface only, so only programs on the same machine can reach it.
 
-If you set `WHISPER_JOB_SERVER_TOKEN`, every request that creates, restarts
-or removes a job must carry `Authorization: Bearer <token>`. The web page asks
-for the token the first time the server answers 401 and keeps it for the
-browser tab. The token does not cover `GET /jobs`, the downloads or the
-WebSocket, so it stops strangers from submitting work, not from reading
-results.
+If you set `WHISPER_JOB_SERVER_TOKEN`, every request that creates, restarts or removes a job must carry `Authorization: Bearer <token>`. The web interface asks for the token the first time the server answers 401 and keeps it for the browser tab. The token does not cover `GET /jobs`, the downloads or the WebSocket, so it stops strangers from submitting work, not from reading results.
 
-To expose the server beyond the machine, put it behind a reverse proxy that
-authenticates users and terminates TLS, and point the proxy at the loopback
-address. Do not set `WHISPER_JOB_SERVER_HOST=0.0.0.0` on a network you do not
-control.
+To expose the server beyond the machine, put it behind a reverse proxy that authenticates users and terminates TLS, and point the proxy at the loopback address. Do not set `WHISPER_JOB_SERVER_HOST=0.0.0.0` on a network you do not control.
 
-Uploaded files are stored under a server-generated name, never under the name
-the client sent, and the server checks that the resulting path stays inside
-the `jobs/` folder. Uploads are capped by `WHISPER_JOB_SERVER_MAX_UPLOAD_MB`.
+Uploaded files are stored under a server-generated name, never under the name the client sent, and uploads are capped by `WHISPER_JOB_SERVER_MAX_UPLOAD_MB`.
 
 ## Example
 
-`examples/tone.wav` is a one-second 440 Hz tone, 16 kHz mono, written by
-`examples/make_wav.py` with the standard library `wave` module. It contains no
-speech, so do not expect a real transcript; on a CPU-only run Whisper wrote
-`Beep.` for it. It exercises the whole path: upload, FFmpeg conversion, model
-load, transcription, download.
+`examples/tone.wav` is a one-second 440 Hz tone, 16 kHz mono, written by `examples/make_wav.py` with the standard library `wave` module. It contains no speech, so do not expect a real transcript; on a CPU-only run Whisper wrote `Beep.` for it. It runs the whole path: upload, FFmpeg conversion, model load, transcription and download.
 
 Start the server in one terminal:
 
@@ -226,16 +243,14 @@ curl http://127.0.0.1:8000/jobs
 # {"<id>":{"status":"pending", ... "original_filename":"tone.wav", ...}}
 ```
 
-The first job downloads the 2.9 GB `large-v2` model. When `GET /jobs` reports
-`"status":"done"`, fetch the transcripts:
+When `GET /jobs` reports `"status":"done"`, fetch the transcripts:
 
 ```bash
 curl -OJ http://127.0.0.1:8000/download/<id>/without   # tone_transcription.txt
 curl -OJ http://127.0.0.1:8000/download/<id>/with      # tone_transcription_timestamps.txt
 ```
 
-With a token set, add `-H "Authorization: Bearer <token>"` to the upload
-call.
+With a token set, add `-H "Authorization: Bearer <token>"` to the upload call.
 
 To regenerate the example file:
 
@@ -243,57 +258,38 @@ To regenerate the example file:
 python3 examples/make_wav.py
 ```
 
-### Tests
+## Tests
 
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` and
-`whisper` with small fakes, so they need neither the ML packages nor a model
-download. They cover the filename and extension checks, the upload limit, the
-token, the empty job list, and one full worker run on `examples/tone.wav`
-through FFmpeg with a fake model. That last test needs `ffmpeg` on the `PATH`
-and is skipped otherwise. CI runs the same command on Ubuntu with Python 3.12.
+The tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` and `whisper` with small fakes, so they need neither the ML packages nor a model download. They cover the filename and extension checks, the upload limit, the token, the empty job list, and one full worker run on `examples/tone.wav` through FFmpeg with a fake model. That last test needs `ffmpeg` on the PATH and is skipped otherwise. CI runs the same command on Ubuntu with Python 3.12.
 
-## Job management
+## Job Management
 
-- Job status and progress are pushed over the WebSocket once per second.
-- Jobs are processed one at a time in the order they were submitted.
-- A job that was running when the server stopped is marked failed at the next
-  start and can be restarted.
-- `GET /remove/{job_id}` deletes the job folder, including the upload and the
-  transcripts.
-- The server keeps a running average of transcription time per mode and
-  language in `runtime_history.json` and uses it for the ETA.
+- **Real-Time Updates:** Job status and progress are communicated via WebSocket.
+- **Queue Processing:** Transcription jobs are queued and processed sequentially.
+- **Job Removal:** Completed or failed jobs can be removed through the provided endpoints.
 
 ## Troubleshooting
 
-- FFmpeg errors: check that `ffmpeg` and `ffprobe` run from the shell that
-  starts the server, or set `FFMPEG_BIN` and `FFPROBE_BIN`.
-- First job takes long: the `large-v2` model, about 2.9 GB, downloads into
-  Whisper's cache on the first run.
-- CUDA errors: check `nvidia-smi` and that the installed PyTorch build matches
-  the driver's CUDA version.
-- Speaker detection fails to load the pipeline: check that
-  `HUGGING_FACE_HUB_TOKEN` is set and that the licenses in the installation
-  section are accepted.
-- Details of a failed job are in the `logs` folder next to `app.py`.
+- **FFmpeg Issues:** Verify FFmpeg is installed and available in your PATH.
+- **Initial Model Download:** The first run may take extra time to download the Whisper large-v2 model (approximately 3GB).
+- **CUDA Errors:** Ensure your GPU is CUDA-capable and that the correct PyTorch version is installed; use `nvidia-smi` to verify GPU status.
+- **Hugging Face Token:** Make sure your Hugging Face token is set correctly for speaker detection.
+- **Job Failures:** Check the logs in the `logs` directory for more detailed error messages.
 
-## Limitations
+## Notes
 
-- The model name is fixed to `large-v2` and is loaded again for every job; a
-  stereo job loads it three times.
-- The web page's WebSocket uses `ws://`, so live updates do not work when the
-  page is served over HTTPS through a proxy. Polling `GET /jobs` still works.
-- The web page offers English and German; the API accepts any Whisper language
-  code.
-- The bearer token protects the endpoints that change jobs, not the ones that
-  read them.
-- Speaker detection needs the gated Hugging Face models, and the server's own
-  default estimate puts it at three times the runtime of single speaker mode.
+- **Resource Usage:** Transcription, particularly in speaker detection mode, can be resource intensive.
+- **Model Caching:** The Whisper model is cached after the initial download.
+- **Customization:** Built with FastAPI, Queue Whisperer is designed to be easily extended or modified to meet your requirements.
+- **Model Loading:** The model is fixed to `large-v2` and is loaded again for every job; a stereo job loads it three times.
+- **HTTPS Proxies:** The web interface opens its WebSocket with `ws://`, so live updates do not work when the page is served over HTTPS through a proxy. Polling `GET /jobs` still works.
+- **Languages:** The web interface offers English and German; the API accepts any Whisper language code.
 
 ## License
 
-MIT, see `LICENSE`.
+MIT, see [LICENSE](LICENSE).
