@@ -23,11 +23,12 @@ FAKE_TRANSCRIPT = " hello from the fake model"
 @pytest.fixture(scope="session")
 def app_module(tmp_path_factory):
     workdir = tmp_path_factory.mktemp("server")
-    os.chdir(workdir)
-    sys.path.insert(0, str(REPO_ROOT))
-    for name in ("WHISPER_JOB_SERVER_TOKEN", "WHISPER_JOB_SERVER_CORS_ORIGINS"):
-        os.environ.pop(name, None)
-    return importlib.import_module("app")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.chdir(workdir)
+        patch.syspath_prepend(str(REPO_ROOT))
+        for name in ("WHISPER_JOB_SERVER_TOKEN", "WHISPER_JOB_SERVER_CORS_ORIGINS", "WHISPER_JOB_SERVER_MAX_UPLOAD_MB"):
+            patch.delenv(name, raising=False)
+        yield importlib.import_module("app")
 
 
 @pytest.fixture
