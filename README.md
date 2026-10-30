@@ -288,7 +288,7 @@ The Python tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` an
 - **Model Caching:** The Whisper model is cached after the initial download.
 - **Customization:** Built with FastAPI, Queue Whisperer is designed to be easily extended or modified to meet your requirements.
 - **Model Loading:** The model is fixed to `large-v2` and is loaded again for every job; a stereo job loads it three times.
-- **HTTPS Proxies:** The web interface opens its WebSocket with `ws://`, so live updates do not work when the page is served over HTTPS through a proxy. Polling `GET /jobs` still works.
+- **HTTPS Proxies:** The web interface uses `wss://` for HTTPS pages and `ws://` for HTTP pages. Configure your reverse proxy to forward WebSocket upgrades on `/ws`.
 - **Languages:** The web interface offers English and German; the API accepts any Whisper language code.
 
 ## License

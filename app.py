@@ -1728,7 +1728,8 @@ def index():
       xhr.send(formData);
     }
     function connectWebSocket() {
-      const ws = new WebSocket("ws://" + location.host + "/ws");
+      const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+      const ws = new WebSocket(scheme + location.host + "/ws");
       ws.onmessage = function(event) {
         const jobs = JSON.parse(event.data);
         renderJobs(jobs);
