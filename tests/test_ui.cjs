@@ -55,3 +55,11 @@ test('retains job labels and download controls', () => {
   assert.ok(cards[0].innerHTML.includes('href="/download/synthetic/with"'));
   assert.ok(cards[0].innerHTML.includes("removeJob('synthetic')"));
 });
+
+for (const [protocol, expected] of [['http:', 'ws:'], ['https:', 'wss:']]) {
+  test(`uses ${expected} for a page served over ${protocol}`, () => {
+    const { context, sockets } = loadUI(protocol);
+    context.connectWebSocket();
+    assert.deepEqual(sockets, [`${expected}//transcription.example:8443/ws`]);
+  });
+}
