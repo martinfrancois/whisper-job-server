@@ -32,6 +32,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg
           ffmpeg -version
       - run: python -m pytest -rs
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - run: node --test tests/test_ui.cjs
       - name: Regenerate the example and check it matches the committed file
         run: |
           python examples/make_wav.py /tmp/tone.wav
