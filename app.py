@@ -1159,13 +1159,12 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
     try:
         load_ml_runtime()
         try:
-            # Convert any incoming media to a mono 16 kHz WAV so downstream
-            # pipelines (e.g., pyannote) always receive a supported format.
+            # Preserve both channels for stereo jobs; other pipelines need mono.
             run_ffmpeg_command([
                 "-i",
                 input_file_path,
                 "-ac",
-                "1",
+                "2" if mode == "stereo" else "1",
                 "-ar",
                 "16000",
                 "-f",
@@ -1427,19 +1426,15 @@ def split_stereo(input_audio: str, output_dir: str):
     run_ffmpeg_command([
         "-i",
         input_audio,
-        "-map",
-        "0:0",
-        "-ac",
-        "1",
+        "-af",
+        "pan=mono|c0=c0",
         left_channel,
     ])
     run_ffmpeg_command([
         "-i",
         input_audio,
-        "-map",
-        "0:1",
-        "-ac",
-        "1",
+        "-af",
+        "pan=mono|c0=c1",
         right_channel,
     ])
     return left_channel, right_channel
