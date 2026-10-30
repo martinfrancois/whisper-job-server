@@ -1572,6 +1572,10 @@ def index():
       }
       return totalQueueTime;
     }
+    function escapeHTML(value) {
+      return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+    }
     function renderJobs(jobsDict) {
       const jobListDiv = document.getElementById("job-list");
       jobListDiv.innerHTML = "";
@@ -1584,10 +1588,10 @@ def index():
         let filename = job.original_filename || job.input_file.split(/(\\|\/)/g).pop();
         if (filename.startsWith('jobs/')) filename = filename.split('/').pop();
         let statusText = (job.status === "pending") ? "Queued" : job.status;
-        let html = `<div class="font-semibold text-lg">${filename}</div>
-                    <div class="text-sm text-gray-600 dark:text-gray-400">Mode: ${modeMapping[job.mode] || job.mode}</div>
-                    <div class="text-sm text-gray-600 dark:text-gray-400">Language: ${languageMapping[job.language] || job.language || 'English'}</div>
-                    <div class="mt-2"><strong>Status:</strong> ${statusText}</div>`;
+        let html = `<div class="font-semibold text-lg">${escapeHTML(filename)}</div>
+                    <div class="text-sm text-gray-600 dark:text-gray-400">Mode: ${escapeHTML(modeMapping[job.mode] || job.mode)}</div>
+                    <div class="text-sm text-gray-600 dark:text-gray-400">Language: ${escapeHTML(languageMapping[job.language] || job.language || 'English')}</div>
+                    <div class="mt-2"><strong>Status:</strong> ${escapeHTML(statusText)}</div>`;
         if (job.status === "processing") {
           let pct = job.progress || 0;
           html += `<div class="mt-2 flex items-center space-x-2">
@@ -1616,7 +1620,7 @@ def index():
                    </div>`;
         }
         if (["failed", "cancelled"].includes(job.status)) {
-          if (job.error) html += `<div class="mt-2 text-red-400"><strong>Error:</strong> ${job.error}</div>`;
+          if (job.error) html += `<div class="mt-2 text-red-400"><strong>Error:</strong> ${escapeHTML(job.error)}</div>`;
           html += `<div>
                      <button onclick="removeJob('${job.id}')" class="mt-2 px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700">Remove Job</button>
                      <button onclick="restartJob('${job.id}')" class="mt-2 ml-2 px-3 py-1 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">Restart Job</button>
