@@ -1,7 +1,12 @@
 import errno
+import io
+import math
 import os
 import shutil
+import struct
+import sys
 import threading
+import wave
 
 import pytest
 
@@ -140,3 +145,44 @@ def test_worker_transcribes_example_wav_with_fake_model(fake_ml_stack, client):
     assert download.status_code == 200
     assert download.text == FAKE_TRANSCRIPT
     assert 'filename="tone_transcription.txt"' in download.headers["content-disposition"]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None, reason="ffmpeg not installed")
+def test_stereo_worker_preserves_both_channel_signals(fake_ml_stack, client, monkeypatch):
+    app = fake_ml_stack
+    channels = [
+        [int(12000 * math.sin(2 * math.pi * frequency * i / 16000)) for i in range(16000)]
+        for frequency in (440, 880)
+    ]
+    audio = io.BytesIO()
+    with wave.open(audio, "wb") as wav:
+        wav.setparams((2, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(b"".join(struct.pack("<hh", left, right) for left, right in zip(*channels)))
+
+    transcribed = []
+
+    class ChannelCheckingModel:
+        def transcribe(self, audio_path, language="en", fp16=False):
+            channel = len(transcribed)
+            with wave.open(audio_path, "rb") as wav:
+                assert wav.getnchannels() == 1
+                assert wav.getframerate() == 16000
+                assert wav.getsampwidth() == 2
+                samples = struct.unpack("<16000h", wav.readframes(wav.getnframes()))
+            assert list(samples) == channels[channel]
+            transcribed.append(channel)
+            return {"segments": [{"start": 0.0, "end": 1.0, "text": f"channel {channel}"}]}
+
+    monkeypatch.setattr(sys.modules["whisper"], "load_model", lambda name: ChannelCheckingModel())
+    response = upload(client, filename="stereo.wav", data=audio.getvalue(), mode="stereo")
+    assert response.status_code == 200, response.text
+    job_id = response.json()["job_id"]
+    queued = app.job_queue.get_nowait()
+    app.process_job(app.jobs, job_id, queued["file_location"], queued["mode"], queued["language"], threading.Event())
+
+    job = app.jobs[job_id]
+    assert job["status"] == "done", job.get("error")
+    assert transcribed == [0, 1]
+    download = client.get(f"/download/{job_id}/without")
+    assert download.status_code == 200
+    assert download.text == "Speaker 1: channel 0\nSpeaker 2: channel 1"
