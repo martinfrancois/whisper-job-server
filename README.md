@@ -266,7 +266,7 @@ python -m pytest
 node --test tests/test_ui.cjs
 ```
 
-The Python tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` and `whisper` with small fakes, so they need neither the ML packages nor a model download. They cover the filename and extension checks, the upload limit, the token, the empty job list, and worker runs on synthetic mono and stereo audio. The worker tests need `ffmpeg` and `ffprobe` on the PATH and are skipped otherwise. The JavaScript tests check the inline UI renderer using Node.js 24, with no npm dependencies. CI runs both commands on Ubuntu with Python 3.12 and Node.js 24.
+The Python tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` and `whisper` with small fakes, so they need neither the ML packages nor a model download. They cover the filename and extension checks, the upload limit, the token, the empty job list, and worker runs on synthetic mono and stereo audio. The worker tests need `ffmpeg` and `ffprobe` on the PATH and are skipped otherwise. The JavaScript tests check the inline UI renderer using Node.js 24, with no npm dependencies. CI runs both commands on Ubuntu with Python 3.10, 3.12 and 3.13, and Node.js 24.
 
 ## Job Management
 
