@@ -9,7 +9,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  test:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -18,7 +22,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: |
             requirements-web.txt
@@ -40,3 +44,13 @@ jobs:
         run: |
           python examples/make_wav.py /tmp/tone.wav
           cmp /tmp/tone.wav examples/tone.wav
+  test:
+    if: always()
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Require every supported Python check to pass
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+        run: test "$CHECKS_RESULT" = success

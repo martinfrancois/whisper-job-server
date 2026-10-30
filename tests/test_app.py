@@ -160,9 +160,13 @@ def test_stereo_worker_preserves_both_channel_signals(fake_ml_stack, client, mon
         wav.writeframes(b"".join(struct.pack("<hh", left, right) for left, right in zip(*channels)))
 
     transcribed = []
+    loaded_models = []
 
     class ChannelCheckingModel:
         def transcribe(self, audio_path, language="en", fp16=False):
+            assert self is loaded_models[0]
+            assert language == "en"
+            assert fp16 is False
             channel = len(transcribed)
             with wave.open(audio_path, "rb") as wav:
                 assert wav.getnchannels() == 1
@@ -173,7 +177,13 @@ def test_stereo_worker_preserves_both_channel_signals(fake_ml_stack, client, mon
             transcribed.append(channel)
             return {"segments": [{"start": 0.0, "end": 1.0, "text": f"channel {channel}"}]}
 
-    monkeypatch.setattr(sys.modules["whisper"], "load_model", lambda name: ChannelCheckingModel())
+    def load_model(name):
+        assert name == "large-v2"
+        model = ChannelCheckingModel()
+        loaded_models.append(model)
+        return model
+
+    monkeypatch.setattr(sys.modules["whisper"], "load_model", load_model)
     response = upload(client, filename="stereo.wav", data=audio.getvalue(), mode="stereo")
     assert response.status_code == 200, response.text
     job_id = response.json()["job_id"]
@@ -181,6 +191,7 @@ def test_stereo_worker_preserves_both_channel_signals(fake_ml_stack, client, mon
     app.process_job(app.jobs, job_id, queued["file_location"], queued["mode"], queued["language"], threading.Event())
 
     job = app.jobs[job_id]
+    assert len(loaded_models) == 1
     assert job["status"] == "done", job.get("error")
     assert transcribed == [0, 1]
     download = client.get(f"/download/{job_id}/without")
