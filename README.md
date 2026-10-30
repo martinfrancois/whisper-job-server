@@ -48,7 +48,7 @@ At its core, Queue Whisperer is designed to manage a job queue for transcription
 
 ## Prerequisites
 
-- **Python:** Version 3.10.0 up to (but not including) 3.14. Any 3.13.x release is supported, but Python 3.14+ is not. CI runs the tests on Python 3.12 only.
+- **Python:** Version 3.10.0 up to (but not including) 3.14. Any 3.13.x release is supported, but Python 3.14+ is not. CI runs the tests on Python 3.10, 3.12 and 3.13.
 - **FFmpeg:** Installed and available in your system PATH (both `ffmpeg` and `ffprobe`).
 - **GPU (Optional):** A CUDA-capable GPU is recommended for improved performance.
 - **Hugging Face Account:** Required for using speaker detection mode.
@@ -287,7 +287,7 @@ The Python tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` an
 - **Resource Usage:** Transcription, particularly in speaker detection mode, can be resource intensive.
 - **Model Caching:** The Whisper model is cached after the initial download.
 - **Customization:** Built with FastAPI, Queue Whisperer is designed to be easily extended or modified to meet your requirements.
-- **Model Loading:** The model is fixed to `large-v2` and is loaded again for every job; a stereo job loads it three times.
+- **Model Loading:** Each job loads `large-v2` once. Stereo jobs reuse that instance for both channels.
 - **HTTPS Proxies:** The web interface uses `wss://` for HTTPS pages and `ws://` for HTTP pages. Configure your reverse proxy to forward WebSocket upgrades on `/ws`.
 - **Languages:** The web interface offers English and German; the API accepts any Whisper language code.
 

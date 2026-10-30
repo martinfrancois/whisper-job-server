@@ -1195,8 +1195,8 @@ def process_job(shared_jobs, job_id: str, input_file_path: str, mode: str, langu
                 merged_ts.append(f"[{start:.2f}s - {end:.2f}s] {text}")
         elif mode == "stereo":
             left_file, right_file = split_stereo(job_input_file, job_dir)
-            left_plain, left_ts = transcribe_audio(left_file, "Speaker 1", job_language)
-            right_plain, right_ts = transcribe_audio(right_file, "Speaker 2", job_language)
+            left_plain, left_ts = transcribe_audio(model, left_file, "Speaker 1", job_language)
+            right_plain, right_ts = transcribe_audio(model, right_file, "Speaker 2", job_language)
             merged_plain, merged_ts = merge_transcripts((left_plain, left_ts), (right_plain, right_ts))
         elif mode == "diarization":
             sortformer_result = None
@@ -1442,8 +1442,7 @@ def split_stereo(input_audio: str, output_dir: str):
 # ------------------------------------------------------
 # Helper: Transcribe a single file
 # ------------------------------------------------------
-def transcribe_audio(audio_file: str, speaker_label: str, language: str):
-    model = whisper.load_model("large-v2")
+def transcribe_audio(model, audio_file: str, speaker_label: str, language: str):
     result = model.transcribe(
         audio_file,
         language=language,
