@@ -5,4 +5,4 @@ torchaudio==2.9.0
 pyannote.audio==4.0.7
 pyannote.pipeline==4.0.0
 speechbrain==1.0.3
-nemo-toolkit==2.5.0
+nemo-toolkit==2.7.3
