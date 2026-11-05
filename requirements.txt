@@ -1,7 +1,7 @@
 -r requirements-web.txt
 openai-whisper==20250625
 torch==2.15.0
-torchaudio==2.9.0
+torchaudio==2.11.1
 pyannote.audio==4.0.7
 pyannote.pipeline==4.1.0
 speechbrain==1.1.2
