@@ -1,6 +1,6 @@
 -r requirements-web.txt
 openai-whisper==20250625
-torch==2.9.0
+torch==2.15.0
 torchaudio==2.9.0
 pyannote.audio==4.0.7
 pyannote.pipeline==4.1.0
