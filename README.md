@@ -48,7 +48,7 @@ At its core, Queue Whisperer is designed to manage a job queue for transcription
 
 ## Prerequisites
 
-- **Python:** Version 3.10.0 up to (but not including) 3.14. Any 3.13.x release is supported, but Python 3.14+ is not. CI runs the tests on Python 3.10, 3.12 and 3.13.
+- **Python:** Version 3.11.0 up to (but not including) 3.14. Any 3.13.x release is supported, but Python 3.14+ is not. CI runs the tests on Python 3.11, 3.12 and 3.13.
 - **FFmpeg:** Installed and available in your system PATH (both `ffmpeg` and `ffprobe`).
 - **GPU (Optional):** A CUDA-capable GPU is recommended for improved performance.
 - **Hugging Face Account:** Required for using speaker detection mode.
@@ -79,7 +79,7 @@ Ensure FFmpeg is installed and accessible in your system PATH.
 
 ### Virtual Environment Setup
 
-Create and activate a virtual environment using a supported Python interpreter (3.10 ≤ version < 3.14):
+Create and activate a virtual environment using a supported Python interpreter (3.11 ≤ version < 3.14):
 
 ```bash
 python3.13 -m venv venv
@@ -266,7 +266,7 @@ python -m pytest
 node --test tests/test_ui.cjs
 ```
 
-The Python tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` and `whisper` with small fakes, so they need neither the ML packages nor a model download. They cover the filename and extension checks, the upload limit, the token, the empty job list, and worker runs on synthetic mono and stereo audio. The worker tests need `ffmpeg` and `ffprobe` on the PATH and are skipped otherwise. The JavaScript tests check the inline UI renderer using Node.js 24, with no npm dependencies. CI runs both commands on Ubuntu with Python 3.10, 3.12 and 3.13, and Node.js 24.
+The Python tests use FastAPI's `TestClient` and replace `torch`, `torchaudio` and `whisper` with small fakes, so they need neither the ML packages nor a model download. They cover the filename and extension checks, the upload limit, the token, the empty job list, and worker runs on synthetic mono and stereo audio. The worker tests need `ffmpeg` and `ffprobe` on the PATH and are skipped otherwise. The JavaScript tests check the inline UI renderer using Node.js 24, with no npm dependencies. CI runs both commands on Ubuntu with Python 3.11, 3.12 and 3.13, and Node.js 24.
 
 ## Job Management
 
