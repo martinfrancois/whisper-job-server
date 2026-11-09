@@ -104,13 +104,13 @@ python -m pip install -U pip wheel setuptools
 
 ### Python Dependencies
 
+Without a CUDA-capable GPU, skip the command below and use the CPU command at the end of [PyTorch with CUDA Support](#pytorch-with-cuda-support) instead.
+
 Install the required packages:
 
 ```bash
 pip install -r requirements.txt
 ```
-
-Without a CUDA-capable GPU, use the CPU command at the end of [PyTorch with CUDA Support](#pytorch-with-cuda-support) instead.
 
 ### PyTorch with CUDA Support
 
