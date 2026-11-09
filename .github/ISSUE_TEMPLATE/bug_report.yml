@@ -1,0 +1,32 @@
+name: Bug report
+description: Report something that doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Leave out tokens, passwords, private paths, personal data and private recordings or transcripts, also from logs and screenshots.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The request or the steps in the web interface that show the problem, the transcription mode and language, and ideally a small audio file such as `examples/tone.wav`.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit, operating system, Python and FFmpeg versions, GPU and CUDA version or CPU only, and anything else that matters here.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: The server output, or the matching `app_*.log` file from the `logs` directory.
+      render: text
