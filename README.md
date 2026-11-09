@@ -110,6 +110,8 @@ Install the required packages:
 pip install -r requirements.txt
 ```
 
+Without a CUDA-capable GPU, use the CPU command at the end of [PyTorch with CUDA Support](#pytorch-with-cuda-support) instead.
+
 ### PyTorch with CUDA Support
 
 If you have a CUDA-capable GPU, install PyTorch with CUDA support. Visit the [PyTorch Get Started](https://pytorch.org/get-started/locally/) page and choose the options appropriate for your system.
@@ -128,13 +130,13 @@ Then it will show a command next to _"Run this command:"_ like this:
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 ```
 
-If a GPU is not available, install the CPU build of the `torch` and `torchaudio` versions pinned in `requirements.txt`. With the current pins, the command is:
+Run the command in a terminal window.
+
+If a GPU is not available, install the requirements with PyTorch's CPU package index added, in place of the plain `pip install -r requirements.txt` above. pip then takes the CPU builds of the `torch` and `torchaudio` versions pinned in `requirements.txt` and skips the CUDA libraries:
 
 ```bash
-pip3 install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 ```
-
-Run the command in a terminal window.
 
 ### Diarization Assets (Hugging Face)
 
