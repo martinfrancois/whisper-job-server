@@ -1,4 +1,4 @@
-fastapi==0.162.7
+fastapi==0.163.0
 # Starlette 1.7 fixes TestClient's deprecated AnyIO access.
 starlette==1.10.0
 python-multipart==0.0.33
