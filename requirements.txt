@@ -2,7 +2,7 @@
 openai-whisper==20250625
 torch==2.15.0
 torchaudio==2.11.1
-pyannote.audio==4.1.0
+pyannote.audio==4.1.1
 pyannote.pipeline==4.1.0
 speechbrain==1.1.2
 nemo-toolkit==3.0.0
